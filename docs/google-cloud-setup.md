@@ -18,15 +18,17 @@ You need a GCP project with the right APIs enabled and an OAuth client.
 
 1. Open https://console.cloud.google.com
 2. Create a new project or pick an existing one
-3. Enable these APIs (search by name):
-   - **Google Chat API** — required for `get_chat_spaces` / `get_space_messages`
-   - **People API** — required for resolving sender display names
+3. Enable these APIs (search by name, or use direct links):
+   - **Google Chat API** — required for all Chat tools
+     (https://console.cloud.google.com/apis/library/chat.googleapis.com)
+   - **Google Calendar API** — required for all Calendar tools
+     (https://console.cloud.google.com/apis/library/calendar-json.googleapis.com)
 
-Direct link: https://console.cloud.google.com/marketplace/product/google/chat.googleapis.com
-
-> **Note:** People API can only resolve names of users in your contacts. For
-> Workspace coworkers outside your contacts, `sender` will stay as the raw
-> `users/<numeric-id>`. This is a permission limit of user-OAuth, not a bug.
+> **Display-name resolution** uses `chat.memberships.readonly` + space-memberships
+> listings (not the People API anymore), so you do **not** need to enable
+> People API. The first time `list_space_members` / `find_users_by_name` /
+> `search_chat_messages` touches a space, the in-process cache fills with real
+> names for everyone in that space.
 
 ---
 
@@ -66,7 +68,64 @@ vars.
 
 ---
 
-## 3. Chat App configuration (mandatory even for read-only user-OAuth)
+## 3. OAuth consent screen — scopes (Data Access tab)
+
+Google reorganised this UI in 2025 — what used to be called *OAuth consent
+screen* is now **Google Auth Platform** in the GCP console, and the scope list
+lives in a separate tab called **Data Access** (no longer behind *Edit App*).
+
+If you skip this step or miss a scope, Google's consent page **silently issues
+a token without the missing scope** instead of failing — every tool that needs
+that scope then returns `403 Request had insufficient authentication scopes`.
+
+### Add the required scopes
+
+Direct link: https://console.cloud.google.com/auth/scopes (switch to the
+correct project in the top selector first).
+
+Alternate path via menu: **APIs & Services** → **Google Auth Platform** →
+**Data Access** tab.
+
+1. Click **ADD OR REMOVE SCOPES**
+2. In the right-hand filter, paste each scope below one at a time, tick the
+   checkbox on the matched row, then move to the next:
+
+   | Scope | Used by |
+   |---|---|
+   | `https://www.googleapis.com/auth/chat.spaces.readonly` | `get_chat_spaces` |
+   | `https://www.googleapis.com/auth/chat.messages` | read messages, send messages, upload attachments |
+   | `https://www.googleapis.com/auth/chat.memberships.readonly` | `list_space_members`, `find_users_by_name`, display-name resolution |
+   | `https://www.googleapis.com/auth/userinfo.profile` | resolve `"me"` to a `users/<id>` |
+   | `https://www.googleapis.com/auth/calendar.readonly` | `get_calendars`, `get_calendar_freebusy` |
+   | `https://www.googleapis.com/auth/calendar.events` | all `*_calendar_event` tools |
+
+   If a Calendar scope is missing from the filter, the Calendar API is not
+   enabled — go back to §1 and enable it.
+3. Click **UPDATE** at the bottom of the side panel, then **SAVE** on the
+   Data Access page.
+
+### Testing-mode gotcha
+
+If the app is in **Testing** (default for new projects), only accounts in the
+Test users list can complete the OAuth flow.
+
+**Audience** tab → **Test users** → **+ Add users** → add the Google account
+you'll authenticate as.
+
+### Verify the token actually got the scopes
+
+After the one-time auth flow in §4, run:
+
+```bash
+python3 -c "import json; t=json.load(open('token.json')); print('\n'.join(sorted(t['scopes'])))"
+```
+
+You must see all six scopes. If any are missing, **the Data Access list did
+not include them** — re-do this section, `rm token.json`, and re-run §4.
+
+---
+
+## 4. Chat App configuration (mandatory even for read-only user-OAuth)
 
 Even when you authenticate as a user (not a bot), Google Chat API requires a
 Chat App to be configured in the same GCP project. Without it, every API call
@@ -86,7 +145,7 @@ returns `404 Google Chat app not found`.
 
 ---
 
-## 4. Authorization (one-time)
+## 5. Authorization (one-time)
 
 You need a `token.json` that the server will use to call Google. Generate it
 once via CLI flow:
@@ -120,7 +179,7 @@ Then open `http://localhost:8077/auth`.
 
 ---
 
-## 5. Environment variables (alternative to credentials.json)
+## 6. Environment variables (alternative to credentials.json)
 
 The server reads these env vars when `credentials.json` is absent:
 
@@ -166,7 +225,7 @@ directly.
 
 ---
 
-## 6. MCP client wiring
+## 7. MCP client wiring
 
 Add this to your MCP client config (e.g. `~/.config/claude-desktop/claude_desktop_config.json`
 or `.mcp.json`):
@@ -189,22 +248,22 @@ appear in its tool list.
 
 ---
 
-## 7. Verifying it works
+## 8. Verifying it works
 
 In your MCP client, ask the assistant:
 
 > List my Google Chat spaces
 
 If you get a JSON list of spaces, the setup is complete. If you get an error,
-check §8.
+check §9.
 
 ---
 
-## 8. Common pitfalls
+## 9. Common pitfalls
 
 ### `404 Google Chat app not found`
 
-The Chat API is enabled but the Chat App is not configured. See §3. Even with
+The Chat API is enabled but the Chat App is not configured. See §4. Even with
 user-OAuth (no bot), this configuration is mandatory.
 
 ### `Authentication Processing Error: Invalid or expired OAuth state parameter`
@@ -238,20 +297,47 @@ terminal.
 ### `credentials.json not found and GOOGLE_OAUTH_CLIENT_ID / ... not set`
 
 Either drop `credentials.json` into the repo root, OR set the env vars and use
-the wrapper script (not `source .env && uv run ...` — see §5).
+the wrapper script (not `source .env && uv run ...` — see §6).
+
+### `403 Request had insufficient authentication scopes`
+
+Returned by any tool whose scope was not granted on the consent screen. Two
+common causes:
+
+1. The scope is not in the **Data Access** list (§3). Google then silently
+   issued a token without it. Fix: add the scope to Data Access, `rm
+   token.json`, re-run `--auth cli`.
+2. The token was issued before the scope was added to `SCOPES` in
+   `google_chat.py`. Fix: same — `rm token.json` and re-auth.
+
+Verify which scopes are actually in the current token:
+
+```bash
+python3 -c "import json; t=json.load(open('token.json')); print('\n'.join(sorted(t['scopes'])))"
+```
 
 ### Sender shows as `users/<numeric-id>` instead of a real name
 
-People API can only resolve names of users in your contacts. For Workspace
-coworkers outside your contacts, the raw ID stays. This is by design — not a
-bug in the server.
+The in-process display-name cache is empty for that user. The cache fills as
+you call `list_space_members` / `find_users_by_name` for spaces the user is
+in. Cold-start a session does not have it. Workaround: call
+`list_space_members` on the relevant space once, or use `find_users_by_name`
+to pre-warm.
 
-To map your *own* ID, post a test message in a fresh space and read it back;
-the `sender` of your message is your ID.
+The cache resets when the MCP server restarts (it's process-memory only).
+
+### `Scope has changed from X to Y` warning on refresh
+
+Only happens if code passes `SCOPES` to
+`Credentials.from_authorized_user_file(path, SCOPES)` after expanding
+`SCOPES`. This codebase deliberately omits the second arg — see the comment
+near `get_credentials` in `google_chat.py`. If you ever re-add it, every tool
+breaks on token refresh after the next scope expansion, not just the
+new-scope tools.
 
 ---
 
-## 9. Resetting / re-authenticating
+## 10. Resetting / re-authenticating
 
 If you change scopes, switch Google accounts, or the refresh token gets
 revoked:
