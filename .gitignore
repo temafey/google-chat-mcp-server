@@ -92,4 +92,13 @@ jspm_packages/
 .npm
 
 # Optional eslint cache
-.eslintcache 
+.eslintcache
+
+# Local task notes (not tracked)
+tasks/
+
+# Local MCP client config (contains user-specific absolute paths)
+.mcp.json
+credentials.json
+token.json
+.claude/.env.google

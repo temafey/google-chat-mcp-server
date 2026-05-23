@@ -16,19 +16,23 @@ import os
 # Relax scope check - Google may return additional scopes that were previously granted
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
-from pathlib import Path
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 from google_chat import (
     get_credentials,
+    get_client_config,
     save_credentials,
     SCOPES,
+    DEFAULT_CALLBACK_URL,
     token_info
 )
 
 
-def run_cli_auth(credentials_path: str = 'credentials.json'):
+def run_cli_auth():
     """Run OAuth authentication via CLI (for headless environments)."""
+    import sys
+    sys.stdout.write('\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l')
+    sys.stdout.flush()
 
     # Check if we already have valid credentials
     creds = get_credentials()
@@ -37,27 +41,29 @@ def run_cli_auth(credentials_path: str = 'credentials.json'):
         print(f"Token file: {token_info['token_path']}")
         return
 
-    # Check for credentials.json
-    creds_file = Path(credentials_path)
-    if not creds_file.exists():
-        print(f"ERROR: {credentials_path} not found.")
-        print("Please download it from Google Cloud Console and save it in the current directory.")
+    try:
+        client_config = get_client_config()
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}")
         return
 
-    # Use OOB-style redirect for manual code entry
-    # Since Google deprecated OOB, we use localhost but handle it manually
-    flow = InstalledAppFlow.from_client_secrets_file(
-        str(creds_file),
+    flow = InstalledAppFlow.from_client_config(
+        client_config,
         SCOPES,
-        redirect_uri='http://localhost:8000/auth/callback'
+        redirect_uri=DEFAULT_CALLBACK_URL,
     )
 
-    # Generate authorization URL
-    auth_url, _ = flow.authorization_url(
-        access_type='offline',
-        prompt='consent',
-        include_granted_scopes='true'
-    )
+    # Build authorization URL; pre-select account when USER_GOOGLE_EMAIL is set
+    auth_url_kwargs = {
+        'access_type': 'offline',
+        'prompt': 'consent',
+        'include_granted_scopes': 'true',
+    }
+    login_hint = os.environ.get('USER_GOOGLE_EMAIL')
+    if login_hint:
+        auth_url_kwargs['login_hint'] = login_hint
+
+    auth_url, _ = flow.authorization_url(**auth_url_kwargs)
 
     print("\n" + "=" * 60)
     print("AUTHORIZATION REQUIRED")
@@ -70,7 +76,12 @@ def run_cli_auth(credentials_path: str = 'credentials.json'):
     print("   (It will look like: http://localhost:8000/auth/callback?code=...&scope=...)")
     print("\n" + "=" * 60)
 
-    # Get the redirect URL from user
+    # Disable mouse reporting before reading: parent TUIs (Claude Code, tmux)
+    # may leave mouse tracking enabled, in which case clicks/wheel events emit
+    # escape sequences into stdin and corrupt the pasted URL. The disable-write
+    # is what's load-bearing — plain input() works fine after it.
+    sys.stdout.write('\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l')
+    sys.stdout.flush()
     redirect_url = input("\nPaste the full redirect URL here: ").strip()
 
     if not redirect_url:

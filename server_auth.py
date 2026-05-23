@@ -10,6 +10,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 from google_chat import (
     get_credentials,
+    get_client_config,
     save_credentials,
     refresh_token,
     SCOPES,
@@ -23,119 +24,120 @@ oauth_flows: Dict[str, InstalledAppFlow] = {}
 # Create FastAPI app for local auth server
 app = FastAPI(title="Google Chat Auth Server")
 
+async def _start_oauth_flow(callback_url: Optional[str]):
+    """Build the OAuth flow and redirect to Google's consent screen."""
+    if get_credentials():
+        return JSONResponse(
+            content={
+                "status": "already_authenticated",
+                "message": "Valid credentials already exist",
+            }
+        )
+
+    try:
+        client_config = get_client_config()
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    flow = InstalledAppFlow.from_client_config(
+        client_config,
+        SCOPES,
+        redirect_uri=callback_url or DEFAULT_CALLBACK_URL,
+    )
+
+    auth_url, state = flow.authorization_url(
+        access_type='offline',
+        prompt='consent',
+        include_granted_scopes='true',
+    )
+
+    oauth_flows[state] = flow
+    return RedirectResponse(url=auth_url)
+
+
 @app.get("/auth")
 async def start_auth(callback_url: Optional[str] = Query(None)):
     """Start OAuth authentication flow"""
     try:
-        # Check if we already have valid credentials
-        if get_credentials():
-            return JSONResponse(
-                content={
-                    "status": "already_authenticated",
-                    "message": "Valid credentials already exist"
-                }
-            )
-
-        # Initialize OAuth 2.0 flow
-        credentials_path = Path('credentials.json')
-        if not credentials_path.exists():
-            raise FileNotFoundError(
-                "credentials.json not found. Please download it from Google Cloud Console "
-                "and save it in the current directory."
-            )
-
-        flow = InstalledAppFlow.from_client_secrets_file(
-            str(credentials_path), 
-            SCOPES,
-            redirect_uri=callback_url or DEFAULT_CALLBACK_URL
-        )
-
-        # Generate authorization URL with offline access and force approval
-        auth_url, state = flow.authorization_url(
-            access_type='offline',  # Enable offline access
-            prompt='consent',       # Force consent screen to ensure refresh token
-            include_granted_scopes='true'
-        )
-
-        # Store the flow object for later use
-        oauth_flows[state] = flow
-
-        # Redirect user to Google's auth page
-        return RedirectResponse(url=auth_url)
-
+        return await _start_oauth_flow(callback_url)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+async def _handle_oauth_callback(state: str, code: Optional[str], error: Optional[str]):
+    """Shared logic for both /auth/callback and /oauth2callback."""
+    if error:
+        print(f"OAuth callback Error: {error}")
+        raise HTTPException(status_code=400, detail=f"Authorization failed: {error}")
+
+    if not code:
+        print("Error: No authorization code received")
+        raise HTTPException(status_code=400, detail="No authorization code received")
+
+    flow = oauth_flows.get(state)
+    if not flow:
+        print("OAuth callback Error: Invalid state parameter")
+        raise HTTPException(status_code=400, detail="Invalid state parameter")
+
+    try:
+        print("fetching token: ", code)
+        flow.fetch_token(code=code, access_type='offline')
+        print("fetched credentials: ", flow.credentials)
+        creds = flow.credentials
+
+        if not creds.refresh_token:
+            print(f"Error: No refresh token in credentials: {creds}")
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to obtain refresh token. Please try again.",
+            )
+
+        print("saving credentials: ", creds)
+        save_credentials(creds)
+        del oauth_flows[state]
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "message": "Authorization successful. Long-lived token obtained. You can close this window.",
+                "token_file": token_info['token_path'],
+                "expires_at": creds.expiry.isoformat() if creds.expiry else None,
+                "has_refresh_token": bool(creds.refresh_token),
+            }
+        )
+    except Exception:
+        oauth_flows.pop(state, None)
+        raise
+
 
 @app.get("/auth/callback")
 async def auth_callback(
     state: str = Query(...),
     code: Optional[str] = Query(None),
-    error: Optional[str] = Query(None)
+    error: Optional[str] = Query(None),
 ):
-    """Handle OAuth callback"""
+    """Handle OAuth callback (legacy path)."""
     try:
-        if error:
-            print(f"OAuth callback Error: {error}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Authorization failed: {error}"
-            )
+        return await _handle_oauth_callback(state, code, error)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"OAuth callback Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-        if not code:
-            print(f"Error: No authorization code received")
-            raise HTTPException(
-                status_code=400,
-                detail="No authorization code received"
-            )
 
-        # Retrieve the flow object
-        flow = oauth_flows.get(state)
-        if not flow:
-            print(f"OAuth callback Error: Invalid state parameter")
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid state parameter"
-            )
-
-        try:
-            # Exchange auth code for credentials with offline access
-            print("fetching token: ", code)
-            flow.fetch_token(
-                code=code,
-                # Ensure we're requesting offline access for refresh tokens
-                access_type='offline'
-            )
-            print("fetched credentials: ", flow.credentials)
-            creds = flow.credentials
-
-            # Verify we got a refresh token
-            if not creds.refresh_token:
-                print(f"Error: No refresh token in credentials: {creds}")
-                raise HTTPException(
-                    status_code=400,
-                    detail="Failed to obtain refresh token. Please try again."
-                )
-            # Save credentials both to file and memory
-            print("saving credentials: ", creds)
-            save_credentials(creds)
-
-            # Clean up the flow object
-            del oauth_flows[state]
-
-            return JSONResponse(
-                content={
-                    "status": "success",
-                    "message": "Authorization successful. Long-lived token obtained. You can close this window.",
-                    "token_file": token_info['token_path'],
-                    "expires_at": creds.expiry.isoformat() if creds.expiry else None,
-                    "has_refresh_token": bool(creds.refresh_token)
-                }
-            )
-        except Exception as e:
-            # Clean up flow object even if there's an error
-            del oauth_flows[state]
-            raise
-
+@app.get("/oauth2callback")
+async def oauth2callback(
+    state: str = Query(...),
+    code: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+):
+    """Handle OAuth callback (GOOGLE_OAUTH_REDIRECT_URI alias path)."""
+    try:
+        return await _handle_oauth_callback(state, code, error)
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"OAuth callback Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
