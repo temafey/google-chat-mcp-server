@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "me_user_id": null,
+  "me_display_name": null,
+  "enabled": true,
+  "mute_until": null,
+  "poll_cadence_minutes": 10,
+  "quiet_hours": {
+    "start": "22:00",
+    "end": "08:00",
+    "tz": "Europe/Kiev"
+  },
+  "vip_senders": [],
+  "urgency_keywords": [
+    "urgent",
+    "blocker",
+    "prod",
+    "asap",
+    "deadline",
+    "eod"
+  ],
+  "channels": {
+    "gc_inbox": {
+      "enabled": false,
+      "space_name": null
+    },
+    "telegram": {
+      "enabled": false
+    },
+    "windows_toast": {
+      "enabled": false
+    }
+  },
+  "spaces_allowlist": null,
+  "spaces_blocklist": []
+}

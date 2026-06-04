@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import mimetypes
+import tempfile
 import datetime
 from typing import Any, List, Dict, Optional, Tuple
 from google.oauth2.credentials import Credentials
@@ -789,5 +790,80 @@ async def find_users_by_name(
         "match_count": len(matches),
         "matches": sorted(matches.values(), key=lambda r: r["display_name"].lower()),
     }
+
+
+# Triage config — the chat-triage assistant persists its identity cache here.
+# T1.4 owns the full schema; whoami() only writes me_user_id + me_display_name
+# and MERGES into whatever is already on disk (never overwrites other keys).
+TRIAGE_CONFIG_PATH = Path('~/.claude-orchestrator/gchat-triage/config.json').expanduser()
+
+
+def _write_triage_identity(me_user_id: str, me_display_name: Optional[str]) -> None:
+    """Atomically merge the two identity keys into the triage config.
+
+    Reads any existing config, updates ONLY `me_user_id` + `me_display_name`,
+    and writes via a temp file + `os.replace` so a crash or concurrent writer
+    can never leave a partial/corrupt config.json. If the file or directory is
+    missing it is created with just these two keys — the rest of the schema is
+    deliberately left to T1.4.
+    """
+    config_path = TRIAGE_CONFIG_PATH
+    config_dir = config_path.parent
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    data: Dict[str, Any] = {}
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (json.JSONDecodeError, OSError):
+            # Corrupt/unreadable existing file: fall back to a fresh object
+            # rather than crashing. We still only own the two identity keys.
+            data = {}
+
+    data['me_user_id'] = me_user_id
+    data['me_display_name'] = me_display_name
+
+    fd, tmp_path = tempfile.mkstemp(dir=str(config_dir), prefix='.config-', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as tmp:
+            json.dump(data, tmp, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_path, config_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+async def whoami() -> Dict[str, Any]:
+    """Resolve the authenticated user's Chat identity and cache it for triage.
+
+    Resolves `users/<id>` via the OAuth2 userinfo endpoint (reusing
+    `_resolve_me_sync`, the same logic `search_chat_messages` uses for
+    `sender="me"`), looks up a best-effort display name from the cache that
+    `_resolve_me_sync` seeds, and persists both into the triage config via an
+    atomic read-modify-write of only those two keys.
+
+    Returns:
+        {"me_user_id": "users/<id>", "me_display_name": "<name or null>"}
+    """
+    creds = get_credentials()
+    if not creds:
+        raise Exception("No valid credentials found. Please authenticate first.")
+
+    me_user_id = await asyncio.to_thread(_resolve_me_sync, creds)
+    # _resolve_me_sync seeds _user_display_name_cache with the user's own name
+    # when userinfo returns one; None is an acceptable fallback per contract.
+    me_display_name = _user_display_name_cache.get(me_user_id)
+
+    await asyncio.to_thread(_write_triage_identity, me_user_id, me_display_name)
+
+    return {"me_user_id": me_user_id, "me_display_name": me_display_name}
 
 
