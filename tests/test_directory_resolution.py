@@ -96,9 +96,16 @@ def _fake_people_service(*, pages=None, get_map=None, list_error=None, get_error
 
 
 @pytest.fixture(autouse=True)
-def _reset_caches():
+def _reset_caches(tmp_path, monkeypatch):
+    # Isolate the in-memory caches AND the persisted directory-cache path so no
+    # test ever reads/writes the real ~/.claude-orchestrator name_cache.json (a
+    # fresh real cache would short-circuit warm_directory_cache and starve the
+    # mocked People service).
     google_chat._user_display_name_cache.clear()
     google_chat._user_aliases.clear()
+    monkeypatch.setattr(
+        google_chat, "_DIRECTORY_CACHE_PATH", tmp_path / "isolated_name_cache.json"
+    )
     yield
     google_chat._user_display_name_cache.clear()
     google_chat._user_aliases.clear()
