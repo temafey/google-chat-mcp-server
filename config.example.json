@@ -32,5 +32,6 @@
     }
   },
   "spaces_allowlist": null,
-  "spaces_blocklist": []
+  "spaces_blocklist": [],
+  "user_aliases": {}
 }

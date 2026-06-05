@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import fcntl
+import logging
 import mimetypes
 import tempfile
 import datetime
@@ -14,6 +15,10 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 from pathlib import Path
+
+# Logs to stderr (or nowhere if unconfigured) — never stdout, which the MCP
+# stdio transport reserves for protocol messages.
+logger = logging.getLogger(__name__)
 
 # If modifying these scopes, delete the file token.json and re-authenticate.
 # `chat.memberships.readonly` is needed by list_space_members / find_users_by_name
@@ -28,10 +33,25 @@ SCOPES = [
     'https://www.googleapis.com/auth/userinfo.profile',
     'https://www.googleapis.com/auth/calendar.readonly',
     'https://www.googleapis.com/auth/calendar.events',
+    # `directory.readonly` powers warm_directory_cache() — People API
+    # listDirectoryPeople resolves every in-domain Chat `users/<id>` to a real
+    # display name (the only resolver that works under user OAuth here).
+    'https://www.googleapis.com/auth/directory.readonly',
 ]
 
 # Cache for user display names: {user_id: display_name}
 _user_display_name_cache: Dict[str, str] = {}
+
+# Highest-priority manual overrides: {"users/<id>": "Name"}. Populated by the
+# collector/backfill from config `user_aliases`; checked BEFORE the resolved
+# cache so a human-curated name always wins over a directory lookup.
+_user_aliases: Dict[str, str] = {}
+
+# Persisted directory-name cache (runtime file, lives OUTSIDE the repo under the
+# triage base dir). Shape: {"fetched_at": <iso8601>, "names": {"<id>": "<name>"}}.
+_DIRECTORY_CACHE_PATH = (
+    Path.home() / ".claude-orchestrator" / "gchat-triage" / "name_cache.json"
+)
 DEFAULT_CALLBACK_URL = os.environ.get(
     'GOOGLE_OAUTH_REDIRECT_URI', 'http://localhost:8000/auth/callback'
 )
@@ -252,23 +272,28 @@ def get_user_display_name(sender: Dict, creds: Optional[Credentials] = None) -> 
     """Return a human-readable display name for a Chat sender — cache only, no network.
 
     Resolution order:
-        1. Module-level cache (`_user_display_name_cache`). Populated by
-           `_resolve_me_sync` (for self) and `list_space_members` /
-           `find_users_by_name` (for any user the caller has met via a
-           space membership listing).
-        2. Inline `displayName` on the sender object (sometimes present for
+        1. Manual alias override (`_user_aliases`) — human-curated names from
+           config `user_aliases`; wins over everything.
+        2. Module-level cache (`_user_display_name_cache`). Populated by
+           `_resolve_me_sync` (for self), `list_space_members` /
+           `find_users_by_name` (for users met via a space membership
+           listing), and `warm_directory_cache` (bulk domain-directory pull).
+        3. Inline `displayName` on the sender object (sometimes present for
            bots; rarely for humans in `messages.list` responses).
-        3. Synthesized `"Bot (xxxxxxxx...)"` for BOT senders.
-        4. Fallback: the raw `users/<id>` string.
+        4. Synthesized `"Bot (xxxxxxxx...)"` for BOT senders.
+        5. Fallback: the raw `users/<id>` string.
 
-    The earlier People-API code path was removed because the current OAuth
-    scopes (`userinfo.profile` only) do not authorize People-API user
-    lookups — every call 403'd and was cached as the user_id, which made
-    the result confusing.
+    This function is CACHE-ONLY — it never hits the network. Directory
+    resolution is performed explicitly by `warm_directory_cache`, which the
+    collector/backfill call before resolving senders, so MCP / interactive
+    callers are never slowed by a People API round-trip.
     """
     user_id = sender.get('name', '') if sender else ''
     if not user_id:
         return 'Unknown'
+
+    if user_id in _user_aliases:
+        return _user_aliases[user_id]
 
     if user_id in _user_display_name_cache:
         return _user_display_name_cache[user_id]
@@ -284,6 +309,209 @@ def get_user_display_name(sender: Dict, creds: Optional[Credentials] = None) -> 
         return display_name
 
     return user_id
+
+
+# --------------------------------------------------------------------------- #
+# Domain-directory name resolution (People API, read-only)
+# --------------------------------------------------------------------------- #
+def set_user_aliases(aliases: Optional[Dict[str, str]]) -> None:
+    """Install manual ``{"users/<id>": "Name"}`` overrides (highest priority).
+
+    Replaces any previously-installed aliases. Called by the collector/backfill
+    from config ``user_aliases``. A falsy argument clears all overrides.
+    """
+    _user_aliases.clear()
+    if aliases:
+        _user_aliases.update(aliases)
+
+
+def _directory_cache_path(cache_path=None) -> Path:
+    return Path(cache_path) if cache_path is not None else _DIRECTORY_CACHE_PATH
+
+
+def _load_directory_cache(cache_path=None) -> Optional[Dict[str, Any]]:
+    """Load the persisted directory cache, or ``None`` if absent/unreadable."""
+    path = _directory_cache_path(cache_path)
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("names"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _install_directory_names(names: Dict[str, str]) -> None:
+    """Load ``{<numeric_id>: <name>}`` into the in-memory display-name cache."""
+    for numeric_id, name in names.items():
+        if numeric_id and name:
+            _user_display_name_cache[f"users/{numeric_id}"] = name
+
+
+def _directory_cache_fresh(data: Dict[str, Any], ttl_hours: float) -> bool:
+    """True when ``data['fetched_at']`` is within ``ttl_hours`` of now."""
+    fetched_at = data.get("fetched_at")
+    if not fetched_at:
+        return False
+    try:
+        text = str(fetched_at)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        fetched = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=datetime.timezone.utc)
+    age = datetime.datetime.now(datetime.timezone.utc) - fetched
+    return age.total_seconds() < ttl_hours * 3600
+
+
+def warm_directory_cache(
+    creds: Optional[Credentials],
+    *,
+    ttl_hours: float = 12,
+    force: bool = False,
+    cache_path=None,
+) -> int:
+    """Populate the display-name cache from the Workspace domain directory.
+
+    READ-ONLY. Resolves every in-domain Chat ``users/<id>`` to a real display
+    name via People API ``listDirectoryPeople`` (domain-profile source). The
+    result is persisted to ``name_cache.json`` and loaded into
+    ``_user_display_name_cache`` keyed as ``users/<id>``.
+
+    Behaviour:
+        * Fresh persisted cache (< ``ttl_hours``) and not ``force`` → load it
+          and skip the network entirely.
+        * Otherwise fetch (paginated), persist, and load.
+        * Any failure (no scope / 403 / API disabled / network) is swallowed —
+          a warning is logged and the previously-persisted names (if any) are
+          loaded as a fallback. NEVER raises; the caller degrades to raw ids.
+
+    Returns the number of names loaded into the in-memory cache.
+    """
+    cached = _load_directory_cache(cache_path)
+    if cached and not force and _directory_cache_fresh(cached, ttl_hours):
+        names = cached.get("names", {})
+        _install_directory_names(names)
+        return len(names)
+
+    if creds is None:
+        if cached:
+            names = cached.get("names", {})
+            _install_directory_names(names)
+            return len(names)
+        return 0
+
+    names: Dict[str, str] = {}
+    try:
+        service = build('people', 'v1', credentials=creds)
+        page_token: Optional[str] = None
+        while True:
+            kwargs: Dict[str, Any] = {
+                "readMask": "names,emailAddresses,metadata",
+                "sources": ["DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"],
+                "pageSize": 1000,
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = service.people().listDirectoryPeople(**kwargs).execute()
+            for person in resp.get("people", []):
+                person_names = person.get("names") or []
+                display = person_names[0].get("displayName") if person_names else None
+                if not display:
+                    continue
+                for source in (person.get("metadata") or {}).get("sources", []):
+                    sid = source.get("id")
+                    if sid:
+                        names[sid] = display
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    except HttpError as exc:
+        logger.warning(
+            "warm_directory_cache: People API listDirectoryPeople failed "
+            "(status=%s); falling back to cached/raw ids.",
+            getattr(getattr(exc, "resp", None), "status", "?"),
+        )
+        if cached:
+            fallback = cached.get("names", {})
+            _install_directory_names(fallback)
+            return len(fallback)
+        return 0
+    except Exception as exc:  # noqa: BLE001 - degrade, never crash the collector.
+        logger.warning(
+            "warm_directory_cache: unexpected error (%s); falling back.",
+            type(exc).__name__,
+        )
+        if cached:
+            fallback = cached.get("names", {})
+            _install_directory_names(fallback)
+            return len(fallback)
+        return 0
+
+    # Persist atomically (temp + os.replace), then load into the live cache.
+    payload = {
+        "fetched_at": datetime.datetime.now(datetime.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "names": names,
+    }
+    path = _directory_cache_path(cache_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".name_cache-", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(tmp_name, str(path))
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+            raise
+    except OSError:
+        logger.warning("warm_directory_cache: could not persist name cache.")
+
+    _install_directory_names(names)
+    return len(names)
+
+
+def resolve_one_via_people_get(
+    numeric_id: str, creds: Optional[Credentials]
+) -> Optional[str]:
+    """Resolve a single ``<numeric_id>`` via People ``people.get`` — read-only.
+
+    Fallback for an id missing from the bulk directory map. On success the name
+    is cached (keyed ``users/<id>``) and returned; any error is swallowed and
+    ``None`` returned so the caller can degrade to the raw id.
+    """
+    if not numeric_id or creds is None:
+        return None
+    try:
+        service = build('people', 'v1', credentials=creds)
+        person = (
+            service.people()
+            .get(resourceName=f"people/{numeric_id}", personFields="names")
+            .execute()
+        )
+        person_names = person.get("names") or []
+        display = person_names[0].get("displayName") if person_names else None
+        if display:
+            _user_display_name_cache[f"users/{numeric_id}"] = display
+            return display
+    except Exception as exc:  # noqa: BLE001 - degrade, never crash.
+        logger.warning(
+            "resolve_one_via_people_get(%s): %s; degrading to raw id.",
+            numeric_id,
+            type(exc).__name__,
+        )
+    return None
 
 
 # MCP functions
