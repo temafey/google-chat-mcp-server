@@ -47,7 +47,6 @@ import json
 import os
 import sys
 import time
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -137,20 +136,12 @@ def _release_lock(fh) -> None:
         fh.close()
 
 
-@contextmanager
-def _token_lock(token_lock_path: Path):
-    """R2: hold a blocking lock around the credential load/refresh.
-
-    Blocking (not LOCK_NB): if the MCP server is mid-refresh we *wait* for it
-    rather than racing. The critical section is intentionally tiny — only the
-    ``get_credentials`` call that may rewrite ``token.json`` — so the MCP
-    server is never blocked for the duration of the API scan.
-    """
-    fh = _acquire_lock(token_lock_path, blocking=True)
-    try:
-        yield
-    finally:
-        _release_lock(fh)
+# NOTE (R2 token-refresh race): the advisory token lock used to live HERE, as an
+# external wrapper around ``gchat.get_credentials()``. It has moved INSIDE
+# ``google_chat.get_credentials`` (on ``<token>.lock``) so EVERY caller — this
+# collector and the MCP server alike — is serialized automatically. Re-adding an
+# external token lock here would make this process take ``<token>.lock`` twice
+# via two different fds, which with ``flock`` self-deadlocks. Don't.
 
 
 # --------------------------------------------------------------------------- #
@@ -292,7 +283,6 @@ def collect(
     store_path=None,
     base_dir=None,
     token_path=None,
-    token_lock_path=None,
     now=None,
     lookback_hours: int = DEFAULT_LOOKBACK_HOURS,
     sleep=time.sleep,
@@ -335,19 +325,16 @@ def collect(
     until_iso = _iso_z(now_dt)
     log("window", since=since_iso, until=until_iso)
 
-    # --- R2: load/refresh credentials under the token lock ------------------ #
+    # --- R2: load/refresh credentials --------------------------------------- #
+    # The advisory token lock now lives INSIDE gchat.get_credentials() (on
+    # ``<token>.lock``), serializing this collector with the MCP server. We only
+    # point google_chat at the right token path; get_credentials() takes and
+    # releases the lock itself. NO external token lock here (see note above) —
+    # double-locking the same file via two fds would self-deadlock under flock.
     if token_path is not None:
         gchat.set_token_path(str(token_path))
-        lock_target = token_path
-    else:
-        lock_target = gchat.token_info.get("token_path", gchat.DEFAULT_TOKEN_PATH)
-    if token_lock_path is None:
-        token_lock_path = Path(str(lock_target) + ".lock")
-    else:
-        token_lock_path = Path(token_lock_path)
 
-    with _token_lock(token_lock_path):
-        creds = gchat.get_credentials()
+    creds = gchat.get_credentials()
     if not creds:
         log("error", reason="no-credentials")
         raise RuntimeError(

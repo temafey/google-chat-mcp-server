@@ -1,0 +1,494 @@
+"""scripts/notify.py — headless notification DISPATCHER for the Chat Triage
+Assistant (T2.1).
+
+ZERO Claude/LLM calls. Every decision here is deterministic. The module:
+
+1. Decides which ledger items deserve a notification *right now*
+   (:func:`_is_new_candidate` baseline rule + overdue-promise escalations).
+2. Honours the R5 kill switch (``config.is_active``) and quiet hours
+   (``config.quiet_hours``, wrap-around aware via :mod:`zoneinfo`).
+3. Dispatches a single digest to every enabled :class:`Sender`
+   (ConsoleSender always; GCInboxSender behind its ``enabled()`` gate).
+4. Persists ``last_notified`` / ``promise_escalated_at`` *without* a status
+   transition or a spurious history entry.
+
+The ONLY outward/network write anywhere in this module is
+``google_chat.send_message`` inside :meth:`GCInboxSender.send`, and it is gated
+by :meth:`GCInboxSender.enabled`.
+
+SEAM (T2.1 step 4) — see :func:`_set_item_fields` and the module docstring note
+below. ``scripts/store.py`` exposes no dedicated *no-history* field setter:
+``set_status`` always forces a ``status:*`` history entry and a status change.
+Rather than hack ``set_status`` (forbidden) or edit ``store.py`` (forbidden), we
+set fields on the public item dict (items ARE plain dicts under
+``store["items"][id]`` — documented contract) and persist via ``store.save``.
+If/when ``store.set_fields(store, id, now=None, **fields)`` is added, this module
+prefers it automatically — no change needed here. See the SEAM report.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+from abc import ABC, abstractmethod
+from datetime import datetime, time as dtime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# ``scripts/`` is not an installed package; make sibling modules importable and
+# put the repo root on the path so ``google_chat`` resolves regardless of cwd.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+sys.path.insert(0, str(_REPO_ROOT))
+
+import config  # noqa: E402  (scripts/config.py)
+import store  # noqa: E402  (scripts/store.py)
+import google_chat  # noqa: E402  (repo-root google_chat.py)
+
+
+# --------------------------------------------------------------------------- #
+# Time helpers.
+# --------------------------------------------------------------------------- #
+def _iso(dt: datetime) -> str:
+    """ISO-8601 UTC string (``...Z``, second precision) — matches store.py."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (
+        dt.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _parse_hhmm(value: str) -> dtime:
+    """Parse ``"HH:MM"`` into a :class:`datetime.time`."""
+    hh, _, mm = value.partition(":")
+    return dtime(hour=int(hh), minute=int(mm))
+
+
+def _tz_for(cfg: dict) -> ZoneInfo:
+    return ZoneInfo((cfg.get("quiet_hours") or {}).get("tz") or "UTC")
+
+
+def _resolve_now(cfg: dict, now=None) -> datetime:
+    """Return an aware ``now``; default to wall clock in the config tz."""
+    tz = _tz_for(cfg)
+    if now is None:
+        return datetime.now(tz)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=tz)
+    return now
+
+
+def in_quiet_hours(now: datetime, cfg: dict) -> bool:
+    """Is ``now`` inside ``[quiet_hours.start, quiet_hours.end)`` (config tz)?
+
+    Handles the wrap-around window (e.g. ``22:00`` → ``08:00`` spans midnight).
+    """
+    qh = cfg.get("quiet_hours") or {}
+    start_s, end_s = qh.get("start"), qh.get("end")
+    if not start_s or not end_s:
+        return False
+    local = now.astimezone(_tz_for(cfg)).time()
+    start, end = _parse_hhmm(start_s), _parse_hhmm(end_s)
+    if start <= end:
+        return start <= local < end
+    # Wrap-around: inside if at/after start OR before end.
+    return local >= start or local < end
+
+
+# --------------------------------------------------------------------------- #
+# Notifiability (deterministic — no LLM).
+# --------------------------------------------------------------------------- #
+def _matches_baseline(item: dict, cfg: dict) -> bool:
+    """BASELINE: direct_dm OR vip sender OR urgency keyword in text."""
+    if item.get("trigger") == "direct_dm":
+        return True
+    if item.get("sender_id") in set(cfg.get("vip_senders") or []):
+        return True
+    text = (item.get("text") or "").lower()
+    for kw in cfg.get("urgency_keywords") or []:
+        if kw and kw.lower() in text:
+            return True
+    return False
+
+
+def _is_new_candidate(item: dict, cfg: dict) -> bool:
+    """NEW-notify candidate: status==new AND never notified AND baseline."""
+    return (
+        item.get("status") == "new"
+        and item.get("last_notified") is None
+        and _matches_baseline(item, cfg)
+    )
+
+
+def new_candidates(store_data: dict, cfg: dict) -> list:
+    return [
+        it
+        for it in store_data.get("items", {}).values()
+        if _is_new_candidate(it, cfg)
+    ]
+
+
+def escalation_candidates(store_data: dict, now: datetime) -> list:
+    """Overdue promises not yet escalated (``promise_escalated_at`` unset).
+
+    Fires even when ``last_notified`` is already set — the safety net.
+    """
+    return [
+        it
+        for it in store.overdue_promises(store_data, now=now)
+        if it.get("promise_escalated_at") is None
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Sender plugin architecture.
+# --------------------------------------------------------------------------- #
+class Sender(ABC):
+    """A notification channel. Keep the registry (``build_senders``) trivially
+    extensible — Telegram / Windows-toast senders drop in here in Wave E."""
+
+    name: str = "sender"
+
+    @abstractmethod
+    def enabled(self, cfg: dict) -> bool:  # pragma: no cover - interface
+        ...
+
+    @abstractmethod
+    def send(self, summary: str, items: list) -> bool:  # pragma: no cover
+        ...
+
+
+class ConsoleSender(Sender):
+    """Always available; prints the digest to stdout (cron logs / tests)."""
+
+    name = "console"
+
+    def enabled(self, cfg: dict) -> bool:
+        return True
+
+    def send(self, summary: str, items: list) -> bool:
+        print(summary)
+        return True
+
+
+class GCInboxSender(Sender):
+    """Posts the digest to a Google Chat space via ``google_chat.send_message``.
+
+    Enabled iff ``channels.gc_inbox.enabled`` AND a ``space_name`` is set. This
+    is the ONLY outward/network write call in the module.
+    """
+
+    name = "gc_inbox"
+
+    def __init__(self, cfg: dict | None = None):
+        gc = ((cfg or {}).get("channels") or {}).get("gc_inbox") or {}
+        self._space_name = gc.get("space_name")
+
+    def enabled(self, cfg: dict) -> bool:
+        gc = (cfg.get("channels") or {}).get("gc_inbox") or {}
+        return bool(gc.get("enabled")) and bool(gc.get("space_name"))
+
+    def send(self, summary: str, items: list) -> bool:
+        # The sole network/write call. ``send_message`` is async in
+        # google_chat.py; bridge it for this sync dispatcher. Tests may patch
+        # google_chat.send_message with either a coroutine or a plain function.
+        result = google_chat.send_message(self._space_name, summary)
+        if asyncio.iscoroutine(result):
+            result = asyncio.run(result)
+        if isinstance(result, dict) and result.get("error"):
+            print(
+                f"[notify] gc_inbox send failed: {result.get('error')}",
+                file=sys.stderr,
+            )
+            return False
+        return True
+
+
+class TelegramSender(Sender):
+    """Posts the digest to a Telegram chat via the Bot API ``sendMessage``.
+
+    Enabled iff ``channels.telegram.enabled`` AND both a bot token and a chat id
+    are available. The token comes from ``secrets.env`` (``TELEGRAM_BOT_TOKEN``);
+    the chat id from ``secrets.env`` (``TELEGRAM_CHAT_ID``) or, as a fallback,
+    ``channels.telegram.chat_id`` — secrets win. Secrets are read fresh each
+    cycle (``config.load_secrets``) so adding a token does not require a restart.
+
+    Stdlib only (``urllib.request`` + ``json``). The bot URL embeds the token, so
+    it is NEVER printed or logged — failure messages carry only the Telegram
+    ``description`` or a generic exception class name.
+    """
+
+    name = "telegram"
+
+    # Telegram messages cap at 4096 chars; stay safely under with a round 4000.
+    _TEXT_LIMIT = 4000
+    _TIMEOUT = 10  # seconds
+
+    def __init__(self, cfg: dict | None = None, secrets: dict | None = None):
+        secrets = config.load_secrets() if secrets is None else secrets
+        tg = ((cfg or {}).get("channels") or {}).get("telegram") or {}
+        self._token = secrets.get("TELEGRAM_BOT_TOKEN")
+        # Secrets win; fall back to a chat_id pinned in config if present.
+        self._chat_id = secrets.get("TELEGRAM_CHAT_ID") or tg.get("chat_id")
+
+    def enabled(self, cfg: dict) -> bool:
+        tg = (cfg.get("channels") or {}).get("telegram") or {}
+        return bool(tg.get("enabled")) and bool(self._token) and bool(self._chat_id)
+
+    def _http_post(self, url: str, payload: dict) -> dict:
+        """POST ``payload`` as JSON to ``url`` and return the parsed JSON body.
+
+        SEAM: the sole network call. Tests patch THIS method so no test ever
+        touches the wire. Raises on transport/HTTP errors (caller catches).
+        """
+        import json as _json
+        import urllib.request
+
+        data = _json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self._TIMEOUT) as resp:
+            return _json.loads(resp.read().decode("utf-8"))
+
+    def send(self, summary: str, items: list) -> bool:
+        # Build the token-bearing URL locally; it must never escape this scope.
+        url = f"https://api.telegram.org/bot{self._token}/sendMessage"
+        payload = {
+            "chat_id": self._chat_id,
+            # PLAIN text — no parse_mode. The digest contains •⏰📥 and quotes
+            # that would break Markdown/HTML parsing.
+            "text": summary[: self._TEXT_LIMIT],
+            "disable_web_page_preview": True,
+        }
+        try:
+            body = self._http_post(url, payload)
+        except Exception as exc:  # noqa: BLE001 - isolate + sanitize
+            # NEVER include the URL/token; only a generic exception class name.
+            print(
+                f"[notify] telegram send failed: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+            return False
+        if isinstance(body, dict) and body.get("ok") is True:
+            return True
+        # ok:false — surface only Telegram's own ``description`` (no token).
+        reason = (body or {}).get("description") if isinstance(body, dict) else "bad response"
+        print(f"[notify] telegram send failed: {reason}", file=sys.stderr)
+        return False
+
+
+def build_senders(cfg: dict) -> list:
+    """Return the enabled senders. A trivial list — extend here for Wave E."""
+    candidates = [ConsoleSender(), GCInboxSender(cfg), TelegramSender(cfg)]
+    return [s for s in candidates if s.enabled(cfg)]
+
+
+def _dispatch(senders: list, summary: str, items: list) -> list:
+    """Send to every sender; never let one failure block the others.
+
+    Returns the names of senders that succeeded. A sender that returns False or
+    raises is logged and skipped.
+    """
+    succeeded = []
+    for sender in senders:
+        try:
+            ok = sender.send(summary, items)
+        except Exception as exc:  # noqa: BLE001 - isolate sender failures
+            print(f"[notify] sender {sender.name!r} raised: {exc}", file=sys.stderr)
+            ok = False
+        if ok:
+            succeeded.append(sender.name)
+        else:
+            print(f"[notify] sender {sender.name!r} reported failure", file=sys.stderr)
+    return succeeded
+
+
+# --------------------------------------------------------------------------- #
+# Digest.
+# --------------------------------------------------------------------------- #
+# Display cap on the NEW section only. The header always reports TRUE totals and
+# every dispatched item is still marked notified — this is purely a cap on how
+# many NEW lines the digest TEXT shows, so a large backlog can't produce a
+# wall-of-text message. OVERDUE/escalation lines are never capped (safety net).
+DIGEST_NEW_CAP = 10
+
+
+def _snippet(text, limit: int = 80) -> str:
+    text = (text or "").replace("\n", " ").strip()
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def build_digest(new_items: list, esc_items: list, *, cap=DIGEST_NEW_CAP) -> str:
+    lines = [f"📥 Chat triage — {len(new_items)} new, {len(esc_items)} overdue"]
+    # cap <= 0 means "no cap" (show all); the default stays DIGEST_NEW_CAP.
+    shown_new = new_items if cap <= 0 else new_items[:cap]
+    for it in shown_new:
+        lines.append(
+            f"• NEW [{it.get('trigger')}] {it.get('sender_name')}: {_snippet(it.get('text'))}"
+        )
+    if cap > 0 and len(new_items) > cap:
+        lines.append(f"• …and {len(new_items) - cap} more new")
+    for it in esc_items:
+        promise = it.get("my_promise") or "(unspecified)"
+        lines.append(
+            f"• ⏰ OVERDUE {it.get('sender_name')}: promise \"{_snippet(promise, 60)}\""
+            f" due {it.get('promise_due')}"
+        )
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Persistence seam (T2.1 step 4).
+# --------------------------------------------------------------------------- #
+def _set_item_fields(store_data: dict, item_id: str, fields: dict) -> None:
+    """Set ``fields`` on an item WITHOUT a status transition or history entry.
+
+    SEAM: prefer a real ``store.set_fields`` if it ever lands; until then mutate
+    the public item dict directly (NOT a ``set_status`` hack, NOT a store.py
+    edit). Caller persists via ``store.save`` afterwards.
+    """
+    setter = getattr(store, "set_fields", None)
+    if setter is not None:
+        setter(store_data, item_id, **fields)
+    else:
+        store_data["items"][item_id].update(fields)
+
+
+# --------------------------------------------------------------------------- #
+# Dispatch cycle.
+# --------------------------------------------------------------------------- #
+def run_once(
+    store_data: dict,
+    cfg: dict,
+    *,
+    now=None,
+    dry_run: bool = False,
+    store_path=None,
+    senders: list | None = None,
+) -> dict:
+    """Run one dispatch cycle. Returns a result dict describing what happened.
+
+    Never raises on a sender failure. Persists notification state only when at
+    least one sender succeeded, and never under ``dry_run``.
+    """
+    now = _resolve_now(cfg, now)
+    result = {
+        "muted": False,
+        "quiet": False,
+        "dry_run": dry_run,
+        "new_notified": [],
+        "escalated": [],
+        "suppressed_quiet": [],
+        "senders_succeeded": [],
+    }
+
+    # R5 kill switch — emit nothing, exit 0.
+    if not config.is_active(cfg, now=now):
+        result["muted"] = True
+        print("[notify] muted (kill switch / mute_until active) — nothing sent")
+        return result
+
+    quiet = in_quiet_hours(now, cfg)
+    result["quiet"] = quiet
+
+    new_cands = new_candidates(store_data, cfg)
+    esc_cands = escalation_candidates(store_data, now)
+    esc_ids = {it["id"] for it in esc_cands}
+
+    # Quiet hours suppress NEW baseline notifications (hold them, do NOT mark
+    # notified). Overdue escalations still fire — the safety net.
+    if quiet:
+        result["suppressed_quiet"] = [it["id"] for it in new_cands]
+        notify_new = []
+    else:
+        notify_new = [it for it in new_cands if it["id"] not in esc_ids]
+
+    to_dispatch = notify_new + esc_cands
+    if not to_dispatch:
+        print("[notify] no candidates to notify")
+        return result
+
+    summary = build_digest(notify_new, esc_cands)
+
+    if dry_run:
+        print("[notify] DRY-RUN — would dispatch (no send, no persist):")
+        print(summary)
+        result["new_notified"] = [it["id"] for it in notify_new]
+        result["escalated"] = [it["id"] for it in esc_cands]
+        return result
+
+    active = build_senders(cfg) if senders is None else senders
+    succeeded = _dispatch(active, summary, to_dispatch)
+    result["senders_succeeded"] = succeeded
+
+    # Mark notified iff at least one sender succeeded.
+    if succeeded:
+        now_iso = _iso(now)
+        updates: dict = {}
+        for it in notify_new:
+            updates[it["id"]] = {"last_notified": now_iso}
+        for it in esc_cands:
+            updates[it["id"]] = {
+                "last_notified": now_iso,
+                "promise_escalated_at": now_iso,
+            }
+        for iid, fields in updates.items():
+            _set_item_fields(store_data, iid, fields)
+        store.save(store_data, store_path)
+        result["new_notified"] = [it["id"] for it in notify_new]
+        result["escalated"] = [it["id"] for it in esc_cands]
+    else:
+        print("[notify] no sender succeeded — items NOT marked notified")
+
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# CLI.
+# --------------------------------------------------------------------------- #
+def _format_result(result: dict) -> str:
+    if result["muted"]:
+        return "muted — nothing sent"
+    parts = [
+        f"notified={len(result['new_notified'])}",
+        f"escalated={len(result['escalated'])}",
+        f"suppressed_quiet={len(result['suppressed_quiet'])}",
+        f"senders={','.join(result['senders_succeeded']) or '-'}",
+        f"quiet={result['quiet']}",
+        f"dry_run={result['dry_run']}",
+    ]
+    return "dispatch: " + " ".join(parts)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Chat triage notification dispatcher")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="compute + print candidates, send NOTHING, persist NOTHING",
+    )
+    parser.add_argument("--store-path", default=None, help="override store.json path")
+    parser.add_argument("--config-path", default=None, help="override config.json path")
+    args = parser.parse_args(argv)
+
+    cfg = config.load_config(args.config_path)
+    store_data = store.load(args.store_path)
+    result = run_once(
+        store_data,
+        cfg,
+        dry_run=args.dry_run,
+        store_path=args.store_path,
+    )
+    print(_format_result(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

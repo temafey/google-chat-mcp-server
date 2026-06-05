@@ -43,7 +43,7 @@ DEFAULT_CONFIG: dict = {
     "enabled": True,
     "mute_until": None,
     "poll_cadence_minutes": 10,
-    "quiet_hours": {"start": "22:00", "end": "08:00", "tz": "Europe/Kiev"},
+    "quiet_hours": {"start": "22:00", "end": "08:00", "tz": "Europe/Kyiv"},
     "vip_senders": [],
     "urgency_keywords": ["urgent", "blocker", "prod", "asap", "deadline", "eod"],
     "channels": {

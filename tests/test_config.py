@@ -12,6 +12,7 @@ import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -80,6 +81,18 @@ def test_load_config_preserves_unknown_forward_compat_keys(tmp_path):
 
     assert cfg["future_flag"] == 42
     assert cfg["version"] == 1  # default still present
+
+
+# --------------------------------------------------------------------------- #
+# quiet_hours.tz — must be a valid IANA zone constructible by zoneinfo.
+# Guards against the prod crash on hosts whose only tz DB is the declared
+# ``tzdata`` wheel (slim Docker, fresh checkout), and against the deprecated
+# "Europe/Kiev" alias resurfacing.
+# --------------------------------------------------------------------------- #
+def test_default_quiet_hours_tz_constructs():
+    tz = config.DEFAULT_CONFIG["quiet_hours"]["tz"]
+    assert tz == "Europe/Kyiv"  # canonical name, not the deprecated "Europe/Kiev"
+    assert ZoneInfo(tz)  # raises ZoneInfoNotFoundError if the tz DB is missing
 
 
 # --------------------------------------------------------------------------- #

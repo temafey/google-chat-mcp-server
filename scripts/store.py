@@ -259,6 +259,20 @@ def mark_stale(store: dict, item_id_: str, now=None) -> None:
     item.setdefault("history", []).append({"ts": ts, "event": "stale"})
 
 
+def set_fields(store: dict, item_id_: str, now=None, **fields) -> None:
+    """Set arbitrary item fields verbatim. NO status change, NO history entry.
+
+    For notification bookkeeping (``last_notified``, ``promise_escalated_at``).
+    ``now`` is accepted for signature symmetry with the other mutators but is
+    unused — this writes no history entry. Raises ``KeyError`` if the item id
+    is unknown.
+    """
+    item = store.get("items", {}).get(item_id_)
+    if item is None:
+        raise KeyError(f"unknown item id {item_id_!r}")
+    item.update(fields)
+
+
 # --- queries --------------------------------------------------------------
 
 def open_items(store: dict) -> list:

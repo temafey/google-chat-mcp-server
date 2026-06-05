@@ -8,7 +8,7 @@
   "quiet_hours": {
     "start": "22:00",
     "end": "08:00",
-    "tz": "Europe/Kiev"
+    "tz": "Europe/Kyiv"
   },
   "vip_senders": [],
   "urgency_keywords": [

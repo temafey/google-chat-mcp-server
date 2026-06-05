@@ -1,9 +1,11 @@
 import asyncio
 import os
 import json
+import fcntl
 import mimetypes
 import tempfile
 import datetime
+from contextlib import contextmanager
 from typing import Any, List, Dict, Optional, Tuple
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -109,6 +111,38 @@ def set_upload_dir(path: str) -> None:
 def get_upload_dir() -> Path:
     return _upload_dir
 
+def _token_lock_path(token_path) -> Path:
+    """Path of the advisory lock guarding token refresh: ``<token>.lock``.
+
+    This is the SINGLE place the token lock path is derived. Every caller of
+    ``get_credentials`` (the MCP server AND the headless collector) serializes
+    on this same file, so two processes can never refresh + rewrite
+    ``token.json`` concurrently and corrupt it.
+    """
+    return Path(str(token_path) + ".lock")
+
+
+@contextmanager
+def _token_file_lock(token_path):
+    """Hold a blocking, exclusive ``flock`` on ``<token>.lock`` for the block.
+
+    Creates the lock file if missing; NEVER touches ``token.json`` itself. The
+    lock is ALWAYS released (try/finally), even when the body raises — so a
+    failed refresh can't leave the lock wedged for other processes.
+    """
+    lock_path = _token_lock_path(token_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
 def save_credentials(creds: Credentials, token_path: Optional[str] = None) -> None:
     """Save credentials to file and update in-memory cache.
     
@@ -140,30 +174,50 @@ def get_credentials(token_path: Optional[str] = None) -> Optional[Credentials]:
     """
     if token_path is None:
         token_path = token_info['token_path']
-    
+
+    # --- Fast path: a valid in-memory credential needs NO lock -------------- #
+    # The hot path (token already loaded and unexpired) must not contend on the
+    # advisory lock — only the load/refresh/rewrite critical section below is
+    # serialized. A fresh, valid token returns here without touching fcntl.
     creds = token_info['credentials']
-    
-    # If no credentials in memory, try to load from file.
-    # IMPORTANT: do not pass SCOPES here — it forces the library to expect
-    # those exact scopes on refresh, which raises "Scope has changed" the
-    # moment we expand SCOPES (e.g. adding chat.memberships.readonly).
-    # Old tokens keep working for endpoints whose scope they were granted;
-    # endpoints needing the new scope return 403 until the user re-auths.
-    if not creds:
-        token_path = Path(token_path)
-        if token_path.exists():
-            creds = Credentials.from_authorized_user_file(str(token_path))
+    if creds and creds.valid:
+        return creds
+
+    # --- Slow path: load → refresh → save under the token lock -------------- #
+    # We may need to (re)load from file and/or refresh + rewrite token.json.
+    # Serialize on ``<token>.lock`` so a concurrent collector/MCP refresh can't
+    # race us. DOUBLE-CHECKED: another process may have refreshed token.json
+    # while we waited for the lock, so we RE-CHECK validity under the lock and
+    # reload the file before deciding to refresh — avoiding a double-refresh.
+    with _token_file_lock(token_path):
+        creds = token_info['credentials']
+
+        # (Re)load from file under the lock. This picks up a token that another
+        # process refreshed while we were blocked acquiring the lock.
+        # IMPORTANT: do not pass SCOPES here — it forces the library to expect
+        # those exact scopes on refresh, which raises "Scope has changed" the
+        # moment we expand SCOPES (e.g. adding chat.memberships.readonly).
+        # Old tokens keep working for endpoints whose scope they were granted;
+        # endpoints needing the new scope return 403 until the user re-auths.
+        token_path_obj = Path(token_path)
+        if (not creds or not creds.valid) and token_path_obj.exists():
+            creds = Credentials.from_authorized_user_file(str(token_path_obj))
             token_info['credentials'] = creds
 
-    # If we have credentials that need refresh
-    if creds and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            save_credentials(creds, token_path)
-        except Exception:
-            return None
-    
-    return creds if (creds and creds.valid) else None
+        # Re-check after the reload: a fresh token from another process means
+        # we are done — do NOT refresh again.
+        if creds and creds.valid:
+            return creds
+
+        # Still expired → we own the refresh under the lock.
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                save_credentials(creds, token_path)
+            except Exception:
+                return None
+
+        return creds if (creds and creds.valid) else None
 
 async def refresh_token(token_path: Optional[str] = None) -> Tuple[bool, str]:
     """Attempt to refresh the current token.

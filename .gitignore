@@ -102,3 +102,4 @@ tasks/
 credentials.json
 token.json
 .claude/.env.google
+token.json.lock

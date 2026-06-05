@@ -204,6 +204,28 @@ def test_upsert_after_stale_clears_flag(store_path):
     assert s["items"][iid]["stale"] is False
 
 
+# --- set_fields (notification bookkeeping) --------------------------------
+
+def test_set_fields_sets_field_without_status_or_history_change(store_path):
+    s = store.load(store_path)
+    iid = store.upsert_item(s, _sample_item(), now=FIXED)
+    item = s["items"][iid]
+    status_before = item["status"]
+    hist_before = len(item["history"])
+
+    store.set_fields(s, iid, now=FIXED, last_notified="2026-06-04T13:30:00Z")
+
+    assert item["last_notified"] == "2026-06-04T13:30:00Z"
+    assert item["status"] == status_before          # status unchanged
+    assert len(item["history"]) == hist_before        # no history entry added
+
+
+def test_set_fields_unknown_item_raises(store_path):
+    s = store.load(store_path)
+    with pytest.raises(KeyError):
+        store.set_fields(s, "deadbeef", now=FIXED, last_notified="2026-06-04T13:30:00Z")
+
+
 # --- persistence roundtrip ------------------------------------------------
 
 def test_save_load_roundtrip_creates_parent_dir(store_path):
