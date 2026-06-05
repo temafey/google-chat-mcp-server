@@ -342,6 +342,18 @@ def collect(
             "(uv run python server.py --auth cli)."
         )
 
+    # --- Name resolution: aliases (highest) + domain-directory warm-up ------ #
+    # READ-ONLY. Install manual aliases, then bulk-resolve every in-domain
+    # `users/<id>` to a real display name BEFORE items (and their sender_name)
+    # are built by mentions_core. Any failure degrades to raw ids — never
+    # aborts the run.
+    gchat.set_user_aliases(cfg.get("user_aliases") or {})
+    try:
+        resolved = gchat.warm_directory_cache(creds)
+        log("directory-warm", names=resolved)
+    except Exception as exc:  # noqa: BLE001 - defensive; warm itself swallows.
+        log("directory-warm-error", error=type(exc).__name__)
+
     # --- R7: fetch detected items with coarse backoff ----------------------- #
     # ``since`` drives the R3 dormant-space skip inside mentions_core. We scan
     # [since, now]; the per-run cursor is store.last_run.
@@ -372,6 +384,17 @@ def collect(
         if space_name in blocklist:
             continue
         scanned_spaces.add(space_name)
+
+        # Per-id fallback: if the bulk directory warm-up didn't cover this
+        # sender (sender_name is still a raw `users/<id>`), try a single
+        # People `people.get`. Read-only; on failure the raw id is kept.
+        sender_name = item.get("sender_name")
+        if isinstance(sender_name, str) and sender_name.startswith("users/"):
+            numeric_id = sender_name.split("/", 1)[1]
+            resolved = gchat.resolve_one_via_people_get(numeric_id, creds)
+            if resolved:
+                item["sender_name"] = resolved
+
         iid = store.item_id(space_name, item.get("message_name"))
         was_present = iid in store_obj.get("items", {})
         store.upsert_item(store_obj, item, now=now_iso)

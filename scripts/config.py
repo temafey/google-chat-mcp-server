@@ -53,6 +53,10 @@ DEFAULT_CONFIG: dict = {
     },
     "spaces_allowlist": None,
     "spaces_blocklist": [],
+    # Manual sender-name overrides: {"users/<id>": "Display Name"}. Highest
+    # priority in google_chat.get_user_display_name — wins over directory
+    # lookups. Empty by default; the collector/backfill install these.
+    "user_aliases": {},
 }
 
 # Commented placeholders only — NO real values ever land here.
