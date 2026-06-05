@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import sys
 from abc import ABC, abstractmethod
 from datetime import datetime, time as dtime, timezone
@@ -59,6 +60,55 @@ def _iso(dt: datetime) -> str:
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def _parse_iso(value) -> datetime | None:
+    """Parse an ISO-8601 string (``...Z`` or offset) to aware UTC; None on junk."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def relative_time(iso_str, now: datetime | None) -> str:
+    """Coarse human relative age: 'just now' / '5m ago' / '2h ago' / '3d ago'.
+
+    ``now`` is INJECTED (no wall-clock read here) so callers stay testable.
+    Future/garbage timestamps collapse to 'just now'.
+    """
+    dt = _parse_iso(iso_str)
+    if dt is None or now is None:
+        return ""
+    secs = (now.astimezone(timezone.utc) - dt).total_seconds()
+    if secs < 60:
+        return "just now"
+    mins = int(secs // 60)
+    if mins < 60:
+        return f"{mins}m ago"
+    hours = int(secs // 3600)
+    if hours < 24:
+        return f"{hours}h ago"
+    days = int(secs // 86400)
+    return f"{days}d ago"
+
+
+def human_due(iso_str) -> str:
+    """Human due date, e.g. '04 Jun 18:00' (UTC, deterministic). '(no due date)'
+    when absent / unparseable falls back to the raw string."""
+    if not iso_str:
+        return "(no due date)"
+    dt = _parse_iso(iso_str)
+    if dt is None:
+        return str(iso_str)
+    return dt.strftime("%d %b %H:%M")
 
 
 def _parse_hhmm(value: str) -> dtime:
@@ -157,20 +207,26 @@ class Sender(ABC):
         ...
 
     @abstractmethod
-    def send(self, summary: str, items: list) -> bool:  # pragma: no cover
+    def send(self, new_items: list, esc_items: list, now) -> bool:  # pragma: no cover
+        """Render this channel's OWN text from the items and deliver it.
+
+        Each sender owns its formatting dialect (plain / gchat / tg_html) so a
+        single store snapshot renders differently per channel. ``now`` is the
+        injected dispatch clock used for relative timestamps.
+        """
         ...
 
 
 class ConsoleSender(Sender):
-    """Always available; prints the digest to stdout (cron logs / tests)."""
+    """Always available; prints the PLAIN Card digest to stdout (cron logs)."""
 
     name = "console"
 
     def enabled(self, cfg: dict) -> bool:
         return True
 
-    def send(self, summary: str, items: list) -> bool:
-        print(summary)
+    def send(self, new_items: list, esc_items: list, now) -> bool:
+        print(build_digest(new_items, esc_items, now=now))
         return True
 
 
@@ -191,11 +247,15 @@ class GCInboxSender(Sender):
         gc = (cfg.get("channels") or {}).get("gc_inbox") or {}
         return bool(gc.get("enabled")) and bool(gc.get("space_name"))
 
-    def send(self, summary: str, items: list) -> bool:
+    def send(self, new_items: list, esc_items: list, now) -> bool:
+        # Render the Google-Chat dialect (``*bold*`` + ``<url|label>`` links).
+        text = render_card(
+            new_items, esc_items, now=now, mode="gchat", link_fn=chat_permalink
+        )
         # The sole network/write call. ``send_message`` is async in
         # google_chat.py; bridge it for this sync dispatcher. Tests may patch
         # google_chat.send_message with either a coroutine or a plain function.
-        result = google_chat.send_message(self._space_name, summary)
+        result = google_chat.send_message(self._space_name, text)
         if asyncio.iscoroutine(result):
             result = asyncio.run(result)
         if isinstance(result, dict) and result.get("error"):
@@ -257,14 +317,18 @@ class TelegramSender(Sender):
         with urllib.request.urlopen(req, timeout=self._TIMEOUT) as resp:
             return _json.loads(resp.read().decode("utf-8"))
 
-    def send(self, summary: str, items: list) -> bool:
+    def send(self, new_items: list, esc_items: list, now) -> bool:
+        # Render the Telegram HTML dialect. ALL dynamic text is html-escaped
+        # inside render_card (SECURITY: fetched Chat text is untrusted data).
+        text = render_card(
+            new_items, esc_items, now=now, mode="tg_html", link_fn=chat_permalink
+        )
         # Build the token-bearing URL locally; it must never escape this scope.
         url = f"https://api.telegram.org/bot{self._token}/sendMessage"
         payload = {
             "chat_id": self._chat_id,
-            # PLAIN text — no parse_mode. The digest contains •⏰📥 and quotes
-            # that would break Markdown/HTML parsing.
-            "text": summary[: self._TEXT_LIMIT],
+            "parse_mode": "HTML",
+            "text": text[: self._TEXT_LIMIT],
             "disable_web_page_preview": True,
         }
         try:
@@ -290,16 +354,17 @@ def build_senders(cfg: dict) -> list:
     return [s for s in candidates if s.enabled(cfg)]
 
 
-def _dispatch(senders: list, summary: str, items: list) -> list:
+def _dispatch(senders: list, new_items: list, esc_items: list, now) -> list:
     """Send to every sender; never let one failure block the others.
 
-    Returns the names of senders that succeeded. A sender that returns False or
-    raises is logged and skipped.
+    Each sender renders its OWN per-channel text from ``(new_items, esc_items,
+    now)``. Returns the names of senders that succeeded. A sender that returns
+    False or raises is logged and skipped.
     """
     succeeded = []
     for sender in senders:
         try:
-            ok = sender.send(summary, items)
+            ok = sender.send(new_items, esc_items, now)
         except Exception as exc:  # noqa: BLE001 - isolate sender failures
             print(f"[notify] sender {sender.name!r} raised: {exc}", file=sys.stderr)
             ok = False
@@ -319,29 +384,213 @@ def _dispatch(senders: list, summary: str, items: list) -> list:
 # wall-of-text message. OVERDUE/escalation lines are never capped (safety net).
 DIGEST_NEW_CAP = 10
 
+# Block indent for the secondary lines of a Card block (lines 2..4).
+_INDENT = "   "
+# Static label for the permalink line — never user data, never escaped.
+_LINK_LABEL = "🔗 Open in Chat"
 
-def _snippet(text, limit: int = 80) -> str:
-    text = (text or "").replace("\n", " ").strip()
+# Priority → icon. urgent/high → 🔴, medium → 🟡, normal → 🟢, else ⚪.
+_PRIORITY_ICON = {
+    "urgent": "🔴",
+    "high": "🔴",
+    "medium": "🟡",
+    "normal": "🟢",
+}
+
+
+def _snippet(text, limit: int = 140) -> str:
+    """Collapse newlines, strip, truncate to ``limit`` with an ellipsis."""
+    text = (text or "").replace("\r", " ").replace("\n", " ").strip()
+    # Collapse runs of whitespace introduced by the newline flattening.
+    text = " ".join(text.split())
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
-def build_digest(new_items: list, esc_items: list, *, cap=DIGEST_NEW_CAP) -> str:
-    lines = [f"📥 Chat triage — {len(new_items)} new, {len(esc_items)} overdue"]
-    # cap <= 0 means "no cap" (show all); the default stays DIGEST_NEW_CAP.
-    shown_new = new_items if cap <= 0 else new_items[:cap]
-    for it in shown_new:
-        lines.append(
-            f"• NEW [{it.get('trigger')}] {it.get('sender_name')}: {_snippet(it.get('text'))}"
-        )
-    if cap > 0 and len(new_items) > cap:
-        lines.append(f"• …and {len(new_items) - cap} more new")
-    for it in esc_items:
-        promise = it.get("my_promise") or "(unspecified)"
-        lines.append(
-            f"• ⏰ OVERDUE {it.get('sender_name')}: promise \"{_snippet(promise, 60)}\""
-            f" due {it.get('promise_due')}"
-        )
+def chat_permalink(item: dict):
+    """Build a Google Chat deep link from an item — PURE STRING, no network.
+
+    Format (Chat 'Copy link' convention):
+        https://chat.google.com/room/{SPACE_ID}/{MSG_ID}
+    where SPACE_ID = ``space_name`` without the ``spaces/`` prefix and MSG_ID is
+    the dotted id segment after ``messages/`` (e.g. ``L1iw1LfMeSg.L1iw1LfMeSg``).
+
+    VERIFICATION: the per-message URL SHAPE was confirmed against 86 real stored
+    ``message_name`` values — every one is ``spaces/<sid>/messages/<a>.<a>``, and
+    that dotted id is exactly what the Chat UI "Copy link to message" emits in
+    the ``/room/<sid>/<a>.<a>`` path. Fallback chain when a per-message id is not
+    derivable: space-level ``/room/{SPACE_ID}`` → else ``None`` (link omitted).
+    """
+    space = item.get("space_name")
+    msg = item.get("message_name")
+    space_id = None
+    if isinstance(space, str) and space.startswith("spaces/"):
+        space_id = space[len("spaces/"):] or None
+    msg_id = None
+    if isinstance(msg, str) and "/messages/" in msg:
+        prefix, _, mid = msg.partition("/messages/")
+        msg_id = mid or None
+        if space_id is None and prefix.startswith("spaces/"):
+            space_id = prefix[len("spaces/"):] or None
+    if space_id and msg_id:
+        return f"https://chat.google.com/room/{space_id}/{msg_id}"
+    if space_id:
+        return f"https://chat.google.com/room/{space_id}"
+    return None
+
+
+def _priority_icon(item: dict) -> str:
+    return _PRIORITY_ICON.get((item.get("priority") or "").lower(), "⚪")
+
+
+def _is_dm(item: dict) -> bool:
+    if item.get("trigger") == "direct_dm":
+        return True
+    st = (item.get("space_type") or "").upper()
+    return "DM" in st or st == "DIRECT_MESSAGE"
+
+
+def _bold(text: str, mode: str) -> str:
+    if mode == "gchat":
+        return f"*{text}*"
+    if mode == "tg_html":
+        return f"<b>{text}</b>"
+    return text
+
+
+# Google-Chat structural characters → look-alike neutralizers. Chat renders its
+# OWN formatting, so raw ``<url|label>`` (link), ``<users/id>`` (mention) and
+# ``*_~`` (bold/italic/strike) smuggled in fetched message text would render as
+# LIVE markup. We map each to a Unicode look-alike that is visually ~identical
+# but inert to the Chat parser. Applied ONLY to dynamic text via the gchat
+# branch below — never to the ``<url|label>`` / ``*sender*`` we build ourselves.
+_GCHAT_DEFANG = str.maketrans({
+    "<": "‹",  # ‹  SINGLE LEFT-POINTING ANGLE QUOTATION MARK
+    ">": "›",  # ›  SINGLE RIGHT-POINTING ANGLE QUOTATION MARK
+    "|": "∣",  # ∣  DIVIDES
+    "*": "∗",  # ∗  ASTERISK OPERATOR
+    "_": "ˍ",  # ˍ  MODIFIER LETTER LOW MACRON
+    "~": "⁓",  # ⁓  SWUNG DASH
+})
+
+
+def _esc(text, mode: str) -> str:
+    """Neutralize dynamic (untrusted) text per channel; plain passes through.
+
+    SECURITY: fetched Chat text is untrusted DATA and MUST NOT smuggle live
+    markup into a rendered digest.
+    - ``tg_html``: HTML-escape so ``<b>`` / ``<a>`` / ``<script>`` render as
+      literal characters, never as live markup.
+    - ``gchat``: Google Chat renders its own formatting, so defang the structural
+      characters (``< > | * _ ~``) to inert look-alikes — a body containing
+      ``<https://phish|label>`` (spoofed link) or ``<users/all>`` (mention/ping)
+      or ``*x*`` (bold) renders as inert text, not live markup.
+    - ``plain``: no markup engine downstream — pass through verbatim.
+
+    Static emoji / dividers / the link label and the ``<url|label>`` / ``<a>`` we
+    build OURSELVES are never routed through here, so our own permalink and the
+    bold-sender wrapper still render live.
+    """
+    s = "" if text is None else str(text)
+    if mode == "tg_html":
+        return html.escape(s)
+    if mode == "gchat":
+        return s.translate(_GCHAT_DEFANG)
+    return s
+
+
+def _link_line(url, mode: str):
+    """Render the permalink line for ``mode``; None when there is no url."""
+    if not url:
+        return None
+    if mode == "gchat":
+        return f"<{url}|{_LINK_LABEL}>"
+    if mode == "tg_html":
+        return f'<a href="{html.escape(url, quote=True)}">{_LINK_LABEL}</a>'
+    return f"🔗 Open: {url}"
+
+
+def _new_block(item: dict, *, now: datetime | None, mode: str, link_fn) -> str:
+    icon = _priority_icon(item)
+    sender = _bold(_esc(item.get("sender_name") or "(unknown)", mode), mode)
+    if _is_dm(item):
+        location = "Direct message"
+    else:
+        location = item.get("space_display") or item.get("space_name") or "Chat"
+    location = _esc(location, mode)
+    rel = relative_time(item.get("created_time"), now)
+    line2 = f"{location} · {rel}" if rel else location
+    summary = _esc(_snippet(item.get("context_summary") or item.get("text")), mode)
+    lines = [f"{icon} {sender}", f"{_INDENT}{line2}", f"{_INDENT}{summary}"]
+    link = _link_line(link_fn(item) if link_fn else None, mode)
+    if link:
+        lines.append(f"{_INDENT}{link}")
     return "\n".join(lines)
+
+
+def _overdue_block(item: dict, *, mode: str, link_fn) -> str:
+    sender = _bold(_esc(item.get("sender_name") or "(unknown)", mode), mode)
+    promise = _esc(item.get("my_promise") or "(unspecified)", mode)
+    due = _esc(human_due(item.get("promise_due")), mode)
+    lines = [
+        f"⏰ {sender}",
+        f'{_INDENT}promise "{promise}"',
+        f"{_INDENT}due {due}",
+    ]
+    link = _link_line(link_fn(item) if link_fn else None, mode)
+    if link:
+        lines.append(f"{_INDENT}{link}")
+    return "\n".join(lines)
+
+
+def render_card(
+    new_items: list,
+    esc_items: list,
+    *,
+    now: datetime | None,
+    mode: str,
+    link_fn=chat_permalink,
+    cap=DIGEST_NEW_CAP,
+) -> str:
+    """Render the per-channel 'Card' digest.
+
+    ``mode`` ∈ {'plain', 'gchat', 'tg_html'} selects the markup dialect. NEW
+    blocks are capped at ``cap`` (a trailing '…and {k} more new' block is added);
+    OVERDUE blocks are never capped (safety net). ``cap <= 0`` means no cap.
+    """
+    n, m = len(new_items), len(esc_items)
+
+    head = ["📥 Chat triage"]
+    clauses = []
+    if n:
+        clauses.append(f"🆕 {n} new")
+    if m:
+        clauses.append(f"⏰ {m} overdue")
+    if clauses:
+        head.append(" · ".join(clauses))
+    head.append("──────────")
+    header = "\n".join(head)
+
+    blocks: list[str] = []
+    shown = new_items if cap <= 0 else new_items[:cap]
+    for it in shown:
+        blocks.append(_new_block(it, now=now, mode=mode, link_fn=link_fn))
+    if cap > 0 and n > cap:
+        blocks.append(f"…and {n - cap} more new")
+    for it in esc_items:
+        blocks.append(_overdue_block(it, mode=mode, link_fn=link_fn))
+
+    if not blocks:
+        return header
+    # Header glues directly to the first block; blocks are blank-line separated.
+    return header + "\n" + "\n\n".join(blocks)
+
+
+def build_digest(new_items: list, esc_items: list, *, now=None, cap=DIGEST_NEW_CAP) -> str:
+    """PLAIN/console Card render — the no-markup fallback used by ConsoleSender
+    and the ``--dry-run`` preview. ``now`` is injected for relative times."""
+    return render_card(
+        new_items, esc_items, now=now, mode="plain", link_fn=chat_permalink, cap=cap
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -415,17 +664,15 @@ def run_once(
         print("[notify] no candidates to notify")
         return result
 
-    summary = build_digest(notify_new, esc_cands)
-
     if dry_run:
         print("[notify] DRY-RUN — would dispatch (no send, no persist):")
-        print(summary)
+        print(build_digest(notify_new, esc_cands, now=now))
         result["new_notified"] = [it["id"] for it in notify_new]
         result["escalated"] = [it["id"] for it in esc_cands]
         return result
 
     active = build_senders(cfg) if senders is None else senders
-    succeeded = _dispatch(active, summary, to_dispatch)
+    succeeded = _dispatch(active, notify_new, esc_cands, now)
     result["senders_succeeded"] = succeeded
 
     # Mark notified iff at least one sender succeeded.

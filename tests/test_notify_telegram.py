@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # scripts/ on the path so ``import notify`` / ``config`` resolve, mirroring the
@@ -22,6 +23,27 @@ import notify  # noqa: E402
 
 TOKEN = "123456:AAH-secret-bot-token-DO-NOT-LEAK"
 CHAT_ID = "987654321"
+NOW = datetime(2026, 6, 4, 12, 0, tzinfo=timezone.utc)
+
+
+def _item(iid="n0", **over) -> dict:
+    base = {
+        "id": iid,
+        "space_name": "spaces/X",
+        "message_name": f"spaces/X/messages/{iid}.{iid}",
+        "sender_id": "users/sender",
+        "sender_name": "Sender",
+        "text": "hello there",
+        "trigger": "direct_dm",
+        "space_type": "DIRECT_MESSAGE",
+        "priority": "normal",
+        "created_time": "2026-06-04T10:00:00Z",
+        "context_summary": "",
+        "my_promise": None,
+        "promise_due": None,
+    }
+    base.update(over)
+    return base
 
 
 # --------------------------------------------------------------------------- #
@@ -85,7 +107,7 @@ def test_secrets_chat_id_wins_over_config():
 
 
 # --------------------------------------------------------------------------- #
-# send() success — body shape, plain text, no parse_mode.
+# send() success — body shape, HTML parse_mode, rendered Card text.
 # --------------------------------------------------------------------------- #
 def test_send_success_returns_true_with_correct_body(monkeypatch):
     captured = {}
@@ -98,11 +120,14 @@ def test_send_success_returns_true_with_correct_body(monkeypatch):
     monkeypatch.setattr(notify.TelegramSender, "_http_post", fake_post)
     sender = notify.TelegramSender(_cfg(), secrets=_secrets())
 
-    assert sender.send("hello digest", []) is True
+    assert sender.send([_item()], [], NOW) is True
     assert captured["payload"]["chat_id"] == CHAT_ID
-    assert captured["payload"]["text"] == "hello digest"
+    assert captured["payload"]["parse_mode"] == "HTML"  # NEW: HTML render
     assert captured["payload"]["disable_web_page_preview"] is True
-    assert "parse_mode" not in captured["payload"]
+    # Rendered Card text — header + a bold sender in HTML.
+    text = captured["payload"]["text"]
+    assert text.startswith("📥 Chat triage")
+    assert "<b>Sender</b>" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -114,7 +139,7 @@ def test_send_returns_false_on_ok_false(monkeypatch):
 
     monkeypatch.setattr(notify.TelegramSender, "_http_post", fake_post)
     sender = notify.TelegramSender(_cfg(), secrets=_secrets())
-    assert sender.send("digest", []) is False
+    assert sender.send([_item()], [], NOW) is False
 
 
 def test_send_returns_false_on_exception(monkeypatch):
@@ -124,7 +149,7 @@ def test_send_returns_false_on_exception(monkeypatch):
     monkeypatch.setattr(notify.TelegramSender, "_http_post", fake_post)
     sender = notify.TelegramSender(_cfg(), secrets=_secrets())
     # Must NOT raise.
-    assert sender.send("digest", []) is False
+    assert sender.send([_item()], [], NOW) is False
 
 
 def test_send_returns_false_on_non_dict_body(monkeypatch):
@@ -133,7 +158,37 @@ def test_send_returns_false_on_non_dict_body(monkeypatch):
 
     monkeypatch.setattr(notify.TelegramSender, "_http_post", fake_post)
     sender = notify.TelegramSender(_cfg(), secrets=_secrets())
-    assert sender.send("digest", []) is False
+    assert sender.send([_item()], [], NOW) is False
+
+
+# --------------------------------------------------------------------------- #
+# SECURITY — untrusted Chat text must be HTML-escaped, never injected.
+# --------------------------------------------------------------------------- #
+def test_send_escapes_injection_in_payload(monkeypatch):
+    captured = {}
+
+    def fake_post(self, url, payload):
+        captured["payload"] = payload
+        return {"ok": True}
+
+    monkeypatch.setattr(notify.TelegramSender, "_http_post", fake_post)
+    sender = notify.TelegramSender(_cfg(), secrets=_secrets())
+
+    evil = _item(
+        sender_name='<a href="x">click</a>',
+        context_summary="<script>alert(1)</script><b>x</b>",
+    )
+    assert sender.send([evil], [], NOW) is True
+    text = captured["payload"]["text"]
+    # The injected <script> tag is escaped to entities — never raw markup.
+    assert "<script>" not in text
+    assert "&lt;script&gt;" in text
+    # The injected anchor from the sender_name is escaped (quotes too).
+    assert "&lt;a href=&quot;x&quot;&gt;" in text
+    assert "click</a>" not in text  # evil closing tag did not pass through raw
+    # Our OWN static markup still renders live: bold wrapper + permalink anchor.
+    assert "<b>" in text
+    assert f'<a href="https://chat.google.com/' in text  # our permalink only
 
 
 # --------------------------------------------------------------------------- #
@@ -147,7 +202,7 @@ def test_failure_via_exception_does_not_leak_token(monkeypatch, capsys):
     monkeypatch.setattr(notify.TelegramSender, "_http_post", fake_post)
     sender = notify.TelegramSender(_cfg(), secrets=_secrets())
 
-    assert sender.send("digest", []) is False
+    assert sender.send([_item()], [], NOW) is False
     out = capsys.readouterr()
     blob = out.out + out.err
     assert TOKEN not in blob
@@ -162,7 +217,7 @@ def test_failure_via_ok_false_does_not_leak_token(monkeypatch, capsys):
     monkeypatch.setattr(notify.TelegramSender, "_http_post", fake_post)
     sender = notify.TelegramSender(_cfg(), secrets=_secrets())
 
-    assert sender.send("digest", []) is False
+    assert sender.send([_item()], [], NOW) is False
     out = capsys.readouterr()
     blob = out.out + out.err
     assert TOKEN not in blob
@@ -182,8 +237,9 @@ def test_long_summary_truncated_to_4000(monkeypatch):
     monkeypatch.setattr(notify.TelegramSender, "_http_post", fake_post)
     sender = notify.TelegramSender(_cfg(), secrets=_secrets())
 
-    long_summary = "x" * 5000
-    assert sender.send(long_summary, []) is True
+    # A sender_name long enough that the rendered Card exceeds the 4000 cap.
+    huge = _item(sender_name="x" * 5000)
+    assert sender.send([huge], [], NOW) is True
     assert len(captured["payload"]["text"]) == 4000
 
 

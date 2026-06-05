@@ -101,5 +101,8 @@ tasks/
 .mcp.json
 credentials.json
 token.json
+# OAuth token backups must never be committable (e.g. token.json.prewscope.bak).
+token.json.*
+*.bak
 .claude/.env.google
 token.json.lock
