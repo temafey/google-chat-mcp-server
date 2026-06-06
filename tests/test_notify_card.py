@@ -177,6 +177,68 @@ def test_tg_html_new_block_uses_html_markup():
     assert card.count("🔗 Open in Chat") == 1
 
 
+# --------------------------------------------------------------------------- #
+# Telegram expandable blockquote — collapse long summary, link stays visible.
+# --------------------------------------------------------------------------- #
+def test_tg_html_summary_wrapped_in_expandable_blockquote():
+    card = notify.render_card([_item()], [], now=NOW, mode="tg_html")
+    assert "<blockquote expandable>" in card
+    assert "</blockquote>" in card
+    # The summary text lives inside the quote.
+    assert "API audit: enumerate group-chat system messages" in card
+
+
+def test_tg_html_link_is_outside_the_blockquote():
+    # The link must remain visible while the quote is collapsed → it appears
+    # AFTER the closing </blockquote>, never inside the quote.
+    card = notify.render_card([_item()], [], now=NOW, mode="tg_html")
+    close = card.index("</blockquote>")
+    link = card.index('<a href="https://chat.google.com/')
+    assert link > close  # link comes after the quote closes
+    # And the link is not nested inside an open quote.
+    assert "<blockquote" not in card[close + len("</blockquote>"):]
+
+
+def test_tg_html_summary_cap_higher_than_plain():
+    # 'Z' appears nowhere else (sender / location / room URL), so counting it
+    # isolates the summary body length.
+    long = _item(context_summary="", text="Z" * 400)
+    tg = notify.render_card([long], [], now=NOW, mode="tg_html")
+    plain = notify.render_card([long], [], now=NOW, mode="plain")
+    # Telegram shows MORE of the body than the plain ~140 snippet.
+    assert tg.count("Z") > plain.count("Z")
+    assert tg.count("Z") <= 280  # but still bounded by the tg cap
+
+
+def test_tg_html_empty_summary_omits_blockquote():
+    blank = _item(context_summary="", text="")
+    card = notify.render_card([blank], [], now=NOW, mode="tg_html")
+    assert "<blockquote" not in card  # nothing to collapse → no empty quote
+
+
+def test_tg_html_blockquote_injection_cannot_break_out():
+    # SECURITY: a body trying to close our quote and inject markup is escaped.
+    evil = _item(
+        context_summary="</blockquote><script>alert(1)</script><blockquote>x",
+    )
+    card = notify.render_card([evil], [], now=NOW, mode="tg_html")
+    # Only OUR own opening/closing tags exist — the injected ones are escaped.
+    assert card.count("<blockquote expandable>") == 1
+    assert card.count("</blockquote>") == 1
+    assert "&lt;/blockquote&gt;" in card
+    assert "&lt;blockquote&gt;" in card
+    assert "<script>" not in card
+    assert "&lt;script&gt;" in card
+
+
+def test_gchat_and_plain_summary_not_in_blockquote():
+    # The blockquote is a Telegram-only treatment.
+    g = notify.render_card([_item()], [], now=NOW, mode="gchat")
+    p = notify.render_card([_item()], [], now=NOW, mode="plain")
+    assert "blockquote" not in g
+    assert "blockquote" not in p
+
+
 def test_dm_location_label():
     dm = _item(trigger="direct_dm", space_type="DIRECT_MESSAGE", space_display=None)
     card = notify.render_card([dm], [], now=NOW, mode="plain")

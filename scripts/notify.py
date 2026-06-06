@@ -388,6 +388,11 @@ DIGEST_NEW_CAP = 10
 _INDENT = "   "
 # Static label for the permalink line — never user data, never escaped.
 _LINK_LABEL = "🔗 Open in Chat"
+# Telegram-only: the summary is rendered inside an expandable blockquote
+# (collapsed by default, tap to expand), so it can show MORE than the ~140-char
+# plain/gchat snippet. Still bounded — the digest as a whole is wire-capped at
+# 4000 chars, and NEW blocks cap at DIGEST_NEW_CAP, so 280 × 10 stays safe.
+_TG_SUMMARY_CAP = 280
 
 # Priority → icon. urgent/high → 🔴, medium → 🟡, normal → 🟢, else ⚪.
 _PRIORITY_ICON = {
@@ -514,8 +519,23 @@ def _new_block(item: dict, *, now: datetime | None, mode: str, link_fn) -> str:
     location = _esc(location, mode)
     rel = relative_time(item.get("created_time"), now)
     line2 = f"{location} · {rel}" if rel else location
-    summary = _esc(_snippet(item.get("context_summary") or item.get("text")), mode)
-    lines = [f"{icon} {sender}", f"{_INDENT}{line2}", f"{_INDENT}{summary}"]
+    lines = [f"{icon} {sender}", f"{_INDENT}{line2}"]
+
+    raw_summary = item.get("context_summary") or item.get("text")
+    if mode == "tg_html":
+        # Collapse the (often long) summary into an expandable blockquote:
+        # compact by default, tap to expand and read more. The body is
+        # html-escaped (SECURITY: an injected ``</blockquote>`` becomes
+        # ``&lt;/blockquote&gt;`` and cannot break out of the quote); the
+        # ``<blockquote expandable>`` tags are static and not escaped. Skipped
+        # when empty. The link line stays OUTSIDE the quote so it is always
+        # visible/tappable even while the quote is collapsed.
+        body = _esc(_snippet(raw_summary, _TG_SUMMARY_CAP), mode)
+        if body:
+            lines.append(f"<blockquote expandable>{body}</blockquote>")
+    else:
+        lines.append(f"{_INDENT}{_esc(_snippet(raw_summary), mode)}")
+
     link = _link_line(link_fn(item) if link_fn else None, mode)
     if link:
         lines.append(f"{_INDENT}{link}")
