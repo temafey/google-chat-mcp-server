@@ -250,7 +250,7 @@ class GCInboxSender(Sender):
     def send(self, new_items: list, esc_items: list, now) -> bool:
         # Render the Google-Chat dialect (``*bold*`` + ``<url|label>`` links).
         text = render_card(
-            new_items, esc_items, now=now, mode="gchat", link_fn=chat_permalink
+            new_items, esc_items, now=now, mode="gchat", link_fn=chat_room_link
         )
         # The sole network/write call. ``send_message`` is async in
         # google_chat.py; bridge it for this sync dispatcher. Tests may patch
@@ -321,7 +321,7 @@ class TelegramSender(Sender):
         # Render the Telegram HTML dialect. ALL dynamic text is html-escaped
         # inside render_card (SECURITY: fetched Chat text is untrusted data).
         text = render_card(
-            new_items, esc_items, now=now, mode="tg_html", link_fn=chat_permalink
+            new_items, esc_items, now=now, mode="tg_html", link_fn=chat_room_link
         )
         # Build the token-bearing URL locally; it must never escape this scope.
         url = f"https://api.telegram.org/bot{self._token}/sendMessage"
@@ -406,33 +406,28 @@ def _snippet(text, limit: int = 140) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
-def chat_permalink(item: dict):
-    """Build a Google Chat deep link from an item — PURE STRING, no network.
+def chat_room_link(item: dict):
+    """Build a room-level Google Chat link from an item — PURE STRING, no network.
 
-    Format (Chat 'Copy link' convention):
-        https://chat.google.com/room/{SPACE_ID}/{MSG_ID}
-    where SPACE_ID = ``space_name`` without the ``spaces/`` prefix and MSG_ID is
-    the dotted id segment after ``messages/`` (e.g. ``L1iw1LfMeSg.L1iw1LfMeSg``).
-
-    VERIFICATION: the per-message URL SHAPE was confirmed against 86 real stored
-    ``message_name`` values — every one is ``spaces/<sid>/messages/<a>.<a>``, and
-    that dotted id is exactly what the Chat UI "Copy link to message" emits in
-    the ``/room/<sid>/<a>.<a>`` path. Fallback chain when a per-message id is not
-    derivable: space-level ``/room/{SPACE_ID}`` → else ``None`` (link omitted).
+    [EXPLICIT] Returns https://chat.google.com/room/{SPACE_ID}; resolves to the
+      SPACE (room), opening at the latest message. The API resource name
+      spaces/{space}/messages/{message} is an API id, NOT a web address — Google
+      web ignores a hand-appended message segment.
+    [EXPLICIT] Reliable per-message landing requires the UI "Copy link" permalink
+      (Google Workspace, Sep 2023), which is NOT reproducible from the API
+      resource name — no public mapping exists.
+    [INFERRED] The chat.google.com/room/{space} form opens the correct room
+      (empirically confirmed by the maintainer); Google's documented canonical
+      form is the Gmail-embedded mail.google.com/chat/u/0/#chat/space/{id} — we
+      keep the verified chat.google.com form.
+    [ASSUMED] 'opens at the latest message' reflects the maintainer's
+      observation, not a documented guarantee.
+    Fallback: no space_id → None (link line omitted).
     """
     space = item.get("space_name")
-    msg = item.get("message_name")
     space_id = None
     if isinstance(space, str) and space.startswith("spaces/"):
         space_id = space[len("spaces/"):] or None
-    msg_id = None
-    if isinstance(msg, str) and "/messages/" in msg:
-        prefix, _, mid = msg.partition("/messages/")
-        msg_id = mid or None
-        if space_id is None and prefix.startswith("spaces/"):
-            space_id = prefix[len("spaces/"):] or None
-    if space_id and msg_id:
-        return f"https://chat.google.com/room/{space_id}/{msg_id}"
     if space_id:
         return f"https://chat.google.com/room/{space_id}"
     return None
@@ -548,7 +543,7 @@ def render_card(
     *,
     now: datetime | None,
     mode: str,
-    link_fn=chat_permalink,
+    link_fn=chat_room_link,
     cap=DIGEST_NEW_CAP,
 ) -> str:
     """Render the per-channel 'Card' digest.
@@ -589,7 +584,7 @@ def build_digest(new_items: list, esc_items: list, *, now=None, cap=DIGEST_NEW_C
     """PLAIN/console Card render — the no-markup fallback used by ConsoleSender
     and the ``--dry-run`` preview. ``now`` is injected for relative times."""
     return render_card(
-        new_items, esc_items, now=now, mode="plain", link_fn=chat_permalink, cap=cap
+        new_items, esc_items, now=now, mode="plain", link_fn=chat_room_link, cap=cap
     )
 
 

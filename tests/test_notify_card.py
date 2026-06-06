@@ -1,7 +1,7 @@
 """Tests for the per-channel 'Card' rendering layer in scripts/notify.py.
 
 Covers the pure formatting/helper surface added in the Card rework:
-``relative_time``, ``human_due``, ``chat_permalink`` (+ fallback chain), and
+``relative_time``, ``human_due``, ``chat_room_link`` (room-level), and
 ``render_card`` across the three markup dialects (plain / gchat / tg_html),
 including the tg_html injection-escaping SECURITY guarantee.
 """
@@ -82,36 +82,30 @@ def test_human_due_missing():
 
 
 # --------------------------------------------------------------------------- #
-# chat_permalink — pure string construction + fallback chain.
+# chat_room_link — ROOM-LEVEL string construction (no message segment).
 # --------------------------------------------------------------------------- #
-def test_permalink_per_message():
+def test_room_link_is_room_level():
+    # A hand-built URL resolves to the SPACE (room); the message segment is NOT
+    # constructable from the API resource name, so it is omitted entirely.
     item = _item()
-    assert (
-        notify.chat_permalink(item)
-        == "https://chat.google.com/room/AAQAugHrEgY/n0.n0"
-    )
+    url = notify.chat_room_link(item)
+    assert url == "https://chat.google.com/room/AAQAugHrEgY"
+    assert "/messages/" not in url
+    assert "n0.n0" not in url  # message id never enters the URL
 
 
-def test_permalink_real_message_name_shape():
-    # The exact shape verified against the live store (dotted message id).
+def test_room_link_ignores_message_name():
+    # Even with a fully-populated message_name, output stays room-level.
     item = {
         "space_name": "spaces/AAQAugHrEgY",
         "message_name": "spaces/AAQAugHrEgY/messages/L1iw1LfMeSg.L1iw1LfMeSg",
     }
-    assert (
-        notify.chat_permalink(item)
-        == "https://chat.google.com/room/AAQAugHrEgY/L1iw1LfMeSg.L1iw1LfMeSg"
-    )
+    assert notify.chat_room_link(item) == "https://chat.google.com/room/AAQAugHrEgY"
 
 
-def test_permalink_falls_back_to_space_when_no_message():
-    item = {"space_name": "spaces/AAQAugHrEgY", "message_name": None}
-    assert notify.chat_permalink(item) == "https://chat.google.com/room/AAQAugHrEgY"
-
-
-def test_permalink_omitted_when_no_space():
-    assert notify.chat_permalink({"space_name": None, "message_name": None}) is None
-    assert notify.chat_permalink({}) is None
+def test_room_link_omitted_when_no_space():
+    assert notify.chat_room_link({"space_name": None, "message_name": None}) is None
+    assert notify.chat_room_link({}) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -161,22 +155,26 @@ def test_plain_new_block_layout():
     assert "🔴 Mariia Ivanova" in card  # high → 🔴, no bold markup
     assert "   Mobile internal · 2h ago" in card
     assert "   API audit: enumerate group-chat system messages" in card
-    assert "🔗 Open: https://chat.google.com/room/AAQAugHrEgY/n0.n0" in card
+    assert "🔗 Open: https://chat.google.com/room/AAQAugHrEgY" in card
 
 
 def test_gchat_new_block_uses_chat_markup():
     card = notify.render_card([_item()], [], now=NOW, mode="gchat")
     assert "🔴 *Mariia Ivanova*" in card  # *bold*
-    assert "<https://chat.google.com/room/AAQAugHrEgY/n0.n0|🔗 Open in Chat>" in card
+    assert "<https://chat.google.com/room/AAQAugHrEgY|🔗 Open in Chat>" in card
+    # Exactly ONE link line, pointing at the room URL.
+    assert card.count("🔗 Open in Chat") == 1
 
 
 def test_tg_html_new_block_uses_html_markup():
     card = notify.render_card([_item()], [], now=NOW, mode="tg_html")
     assert "🔴 <b>Mariia Ivanova</b>" in card
     assert (
-        '<a href="https://chat.google.com/room/AAQAugHrEgY/n0.n0">🔗 Open in Chat</a>'
+        '<a href="https://chat.google.com/room/AAQAugHrEgY">🔗 Open in Chat</a>'
         in card
     )
+    # Exactly ONE link line, pointing at the room URL.
+    assert card.count("🔗 Open in Chat") == 1
 
 
 def test_dm_location_label():
@@ -282,11 +280,12 @@ def test_gchat_defangs_smuggled_link_mention_and_bold():
     summary_line = [ln for ln in card.splitlines() if "Click" in ln][0]
     assert "*x*" not in summary_line
 
-    # Our OWN markup is untouched and still live.
+    # Our OWN markup is untouched and still live (room-level link, ONE line).
     assert "*Mariia Ivanova*" in card  # bold wrapper added by _bold, after _esc
-    assert (
-        "<https://chat.google.com/room/AAQAugHrEgY/n0.n0|🔗 Open in Chat>" in card
-    )
+    assert "<https://chat.google.com/room/AAQAugHrEgY|🔗 Open in Chat>" in card
+    # Exactly ONE LIVE link structure: the smuggled one was defanged to ‹…∣…›,
+    # so only our own `<https://…|…>` survives as a real Chat link.
+    assert card.count("<https://") == 1
 
 
 def test_gchat_defang_preserves_sender_bold_when_name_has_asterisk():
