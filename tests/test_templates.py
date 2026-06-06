@@ -61,6 +61,18 @@ def test_locale_ru_labels_render():
     assert "🔗 Открыть в чате:" in card  # localized link label
 
 
+def test_locale_uk_labels_render():
+    card = notify.render_card([_item()], [], now=NOW, mode="plain", templates_cfg=_tcfg(locale="uk"))
+    assert "📥 Тріаж чатів" in card
+    assert "🆕 1 нових" in card
+    assert "Оригінальне повідомлення" in card  # localized "Original message"
+    assert "🔗 Відкрити в чаті:" in card  # localized link label
+
+
+def test_three_locales_shipped():
+    assert set(templates.DEFAULT_TEMPLATES["locales"]) >= {"en", "ru", "uk"}
+
+
 def test_locale_partial_custom_fills_from_en():
     # A custom 'en' locale that overrides ONLY the title — every other label falls back
     # to the built-in default, never a bare $placeholder.
@@ -253,7 +265,7 @@ def test_plain_mode_passthrough_in_engine():
 def test_default_config_embeds_templates():
     assert "templates" in config.DEFAULT_CONFIG
     assert config.DEFAULT_CONFIG["templates"]["active_profile"] == "default"
-    assert "ru" in config.DEFAULT_CONFIG["templates"]["locales"]
+    assert {"en", "ru", "uk"} <= set(config.DEFAULT_CONFIG["templates"]["locales"])
 
 
 def test_load_config_upgrades_partial_templates(tmp_path):
