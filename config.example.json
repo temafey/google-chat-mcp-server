@@ -33,5 +33,80 @@
   },
   "spaces_allowlist": null,
   "spaces_blocklist": [],
-  "user_aliases": {}
+  "user_aliases": {},
+  "templates": {
+    "active_profile": "default",
+    "locale": "en",
+    "locales": {
+      "en": {
+        "header_title": "📥 Chat triage",
+        "new_clause": "🆕 $count new",
+        "overdue_clause": "⏰ $count overdue",
+        "more_new": "…and $count more new",
+        "direct_message": "Direct message",
+        "unknown_sender": "(unknown)",
+        "open_link": "🔗 Open in Chat",
+        "original_message": "Original message",
+        "promise_label": "promise",
+        "due_label": "due",
+        "no_due": "(no due date)"
+      },
+      "ru": {
+        "header_title": "📥 Триаж чатов",
+        "new_clause": "🆕 $count новых",
+        "overdue_clause": "⏰ $count просрочено",
+        "more_new": "…и ещё $count новых",
+        "direct_message": "Личное сообщение",
+        "unknown_sender": "(неизвестно)",
+        "open_link": "🔗 Открыть в чате",
+        "original_message": "Исходное сообщение",
+        "promise_label": "обещание",
+        "due_label": "до",
+        "no_due": "(без срока)"
+      }
+    },
+    "profiles": {
+      "default": {
+        "new_cap": 10,
+        "tg_summary_cap": 280,
+        "divider": "──────────",
+        "counts_sep": " · ",
+        "header": "$title\n$counts\n$divider",
+        "new_block": "$icon $sender\n📍 $location · 🕒 $reltime\n💬 $summary$message_block$link_block",
+        "overdue_block": "⏰ $sender\n   $promise_label \"$promise\"\n   $due_label $due$link_block",
+        "show_message": true
+      },
+      "compact": {
+        "new_cap": 15,
+        "tg_summary_cap": 0,
+        "divider": "──────────",
+        "counts_sep": " · ",
+        "header": "$title · $counts",
+        "new_block": "$icon $sender · $location · $reltime\n💬 $summary",
+        "overdue_block": "⏰ $sender · $due_label $due · $promise",
+        "show_message": false
+      },
+      "detailed": {
+        "new_cap": 10,
+        "tg_summary_cap": 700,
+        "divider": "──────────",
+        "counts_sep": " · ",
+        "header": "$title\n$counts\n$divider",
+        "new_block": "$icon $sender\n📍 $location · 🕒 $reltime\n💬 $summary$message_block$link_block",
+        "overdue_block": "⏰ $sender\n   $promise_label \"$promise\"\n   $due_label $due$link_block",
+        "show_message": true
+      }
+    },
+    "variants": [
+      {
+        "when": {
+          "priority": [
+            "urgent",
+            "high"
+          ]
+        },
+        "profile": "detailed"
+      }
+    ]
+  }
 }

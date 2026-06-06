@@ -153,9 +153,12 @@ def test_header_zero_overdue():
 def test_plain_new_block_layout():
     card = notify.render_card([_item()], [], now=NOW, mode="plain")
     assert "🔴 Mariia Ivanova" in card  # high → 🔴, no bold markup
-    assert "   Mobile internal · 2h ago" in card
-    assert "   API audit: enumerate group-chat system messages" in card
-    assert "🔗 Open: https://chat.google.com/room/AAQAugHrEgY" in card
+    assert "📍 Mobile internal · 🕒 2h ago" in card  # labelled meta line
+    assert "💬 API audit: enumerate group-chat system messages" in card  # summary line
+    # The original message appears under a labelled cut (distinct from the summary).
+    assert "   Original message" in card
+    assert "   hello there" in card
+    assert "🔗 Open in Chat: https://chat.google.com/room/AAQAugHrEgY" in card
 
 
 def test_gchat_new_block_uses_chat_markup():
@@ -178,14 +181,19 @@ def test_tg_html_new_block_uses_html_markup():
 
 
 # --------------------------------------------------------------------------- #
-# Telegram expandable blockquote — collapse long summary, link stays visible.
+# Telegram expandable blockquote — collapse the ORIGINAL MESSAGE, link stays visible.
+# The visible 💬 line is the (short) summary; the full message goes under the cut.
 # --------------------------------------------------------------------------- #
-def test_tg_html_summary_wrapped_in_expandable_blockquote():
+def test_tg_html_original_message_wrapped_in_expandable_blockquote():
     card = notify.render_card([_item()], [], now=NOW, mode="tg_html")
     assert "<blockquote expandable>" in card
     assert "</blockquote>" in card
-    # The summary text lives inside the quote.
-    assert "API audit: enumerate group-chat system messages" in card
+    # The ORIGINAL MESSAGE lives inside the quote; the summary stays on the 💬 line.
+    qstart = card.index("<blockquote expandable>")
+    qend = card.index("</blockquote>")
+    assert "hello there" in card[qstart:qend]            # message under the cut
+    assert "API audit" not in card[qstart:qend]          # summary NOT in the quote
+    assert "💬 API audit: enumerate group-chat system messages" in card
 
 
 def test_tg_html_link_is_outside_the_blockquote():
@@ -199,27 +207,40 @@ def test_tg_html_link_is_outside_the_blockquote():
     assert "<blockquote" not in card[close + len("</blockquote>"):]
 
 
-def test_tg_html_summary_cap_higher_than_plain():
-    # 'Z' appears nowhere else (sender / location / room URL), so counting it
-    # isolates the summary body length.
-    long = _item(context_summary="", text="Z" * 400)
+def test_tg_html_message_cap_higher_than_plain():
+    # 'Z' appears nowhere else (sender / location / room URL / summary), so counting
+    # it isolates the original-message body length under the cut. A short summary keeps
+    # the message_block alive; priority 'normal' selects the default profile (cap 280).
+    long = _item(priority="normal", context_summary="short", text="Z" * 400)
     tg = notify.render_card([long], [], now=NOW, mode="tg_html")
     plain = notify.render_card([long], [], now=NOW, mode="plain")
-    # Telegram shows MORE of the body than the plain ~140 snippet.
+    # Telegram expands MORE of the original message than the plain ~140 snippet.
     assert tg.count("Z") > plain.count("Z")
-    assert tg.count("Z") <= 280  # but still bounded by the tg cap
+    assert tg.count("Z") <= 280  # but still bounded by the default-profile tg cap
 
 
-def test_tg_html_empty_summary_omits_blockquote():
+def test_tg_html_no_message_block_when_no_distinct_summary():
+    # No context_summary → the text IS the summary line; no separate expandable cut
+    # (and so no empty/duplicate blockquote).
+    blank = _item(context_summary="", text="just a short dm")
+    card = notify.render_card([blank], [], now=NOW, mode="tg_html")
+    assert "<blockquote" not in card
+    assert "💬 just a short dm" in card
+
+
+def test_tg_html_empty_everything_omits_blockquote():
     blank = _item(context_summary="", text="")
     card = notify.render_card([blank], [], now=NOW, mode="tg_html")
     assert "<blockquote" not in card  # nothing to collapse → no empty quote
 
 
 def test_tg_html_blockquote_injection_cannot_break_out():
-    # SECURITY: a body trying to close our quote and inject markup is escaped.
+    # SECURITY: an original message trying to close our quote and inject markup is
+    # escaped. The message goes under the cut, so the payload lives in ``text`` while a
+    # distinct summary keeps the blockquote alive.
     evil = _item(
-        context_summary="</blockquote><script>alert(1)</script><blockquote>x",
+        context_summary="legit summary",
+        text="</blockquote><script>alert(1)</script><blockquote>x",
     )
     card = notify.render_card([evil], [], now=NOW, mode="tg_html")
     # Only OUR own opening/closing tags exist — the injected ones are escaped.
@@ -248,8 +269,10 @@ def test_dm_location_label():
 def test_summary_falls_back_to_text_and_truncates():
     long = _item(context_summary="", text="A" * 300)
     card = notify.render_card([long], [], now=NOW, mode="plain")
-    # Truncated to ~140 with an ellipsis.
-    body = [ln for ln in card.splitlines() if ln.strip().startswith("A")][0].strip()
+    # No distinct summary → the text fills the 💬 line, truncated to ~140 + ellipsis.
+    line = [ln for ln in card.splitlines() if "A" in ln][0]
+    assert line.startswith("💬 ")
+    body = line[len("💬 "):]
     assert body.endswith("…")
     assert len(body) <= 141
 

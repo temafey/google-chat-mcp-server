@@ -44,6 +44,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 import config  # noqa: E402  (scripts/config.py)
 import store  # noqa: E402  (scripts/store.py)
+import templates  # noqa: E402  (scripts/templates.py — config-driven render engine)
 import google_chat  # noqa: E402  (repo-root google_chat.py)
 
 
@@ -222,11 +223,14 @@ class ConsoleSender(Sender):
 
     name = "console"
 
+    def __init__(self, cfg: dict | None = None):
+        self._templates = (cfg or {}).get("templates")
+
     def enabled(self, cfg: dict) -> bool:
         return True
 
     def send(self, new_items: list, esc_items: list, now) -> bool:
-        print(build_digest(new_items, esc_items, now=now))
+        print(build_digest(new_items, esc_items, now=now, templates_cfg=self._templates))
         return True
 
 
@@ -242,6 +246,7 @@ class GCInboxSender(Sender):
     def __init__(self, cfg: dict | None = None):
         gc = ((cfg or {}).get("channels") or {}).get("gc_inbox") or {}
         self._space_name = gc.get("space_name")
+        self._templates = (cfg or {}).get("templates")
 
     def enabled(self, cfg: dict) -> bool:
         gc = (cfg.get("channels") or {}).get("gc_inbox") or {}
@@ -250,7 +255,8 @@ class GCInboxSender(Sender):
     def send(self, new_items: list, esc_items: list, now) -> bool:
         # Render the Google-Chat dialect (``*bold*`` + ``<url|label>`` links).
         text = render_card(
-            new_items, esc_items, now=now, mode="gchat", link_fn=chat_room_link
+            new_items, esc_items, now=now, mode="gchat", link_fn=chat_room_link,
+            templates_cfg=self._templates,
         )
         # The sole network/write call. ``send_message`` is async in
         # google_chat.py; bridge it for this sync dispatcher. Tests may patch
@@ -293,6 +299,7 @@ class TelegramSender(Sender):
         self._token = secrets.get("TELEGRAM_BOT_TOKEN")
         # Secrets win; fall back to a chat_id pinned in config if present.
         self._chat_id = secrets.get("TELEGRAM_CHAT_ID") or tg.get("chat_id")
+        self._templates = (cfg or {}).get("templates")
 
     def enabled(self, cfg: dict) -> bool:
         tg = (cfg.get("channels") or {}).get("telegram") or {}
@@ -321,7 +328,8 @@ class TelegramSender(Sender):
         # Render the Telegram HTML dialect. ALL dynamic text is html-escaped
         # inside render_card (SECURITY: fetched Chat text is untrusted data).
         text = render_card(
-            new_items, esc_items, now=now, mode="tg_html", link_fn=chat_room_link
+            new_items, esc_items, now=now, mode="tg_html", link_fn=chat_room_link,
+            templates_cfg=self._templates,
         )
         # Build the token-bearing URL locally; it must never escape this scope.
         url = f"https://api.telegram.org/bot{self._token}/sendMessage"
@@ -350,7 +358,7 @@ class TelegramSender(Sender):
 
 def build_senders(cfg: dict) -> list:
     """Return the enabled senders. A trivial list — extend here for Wave E."""
-    candidates = [ConsoleSender(), GCInboxSender(cfg), TelegramSender(cfg)]
+    candidates = [ConsoleSender(cfg), GCInboxSender(cfg), TelegramSender(cfg)]
     return [s for s in candidates if s.enabled(cfg)]
 
 
@@ -386,13 +394,10 @@ DIGEST_NEW_CAP = 10
 
 # Block indent for the secondary lines of a Card block (lines 2..4).
 _INDENT = "   "
-# Static label for the permalink line — never user data, never escaped.
+# Static DEFAULT label for the permalink line — never user data, never escaped. The
+# template engine passes a localized label (config ``templates.locales.*.open_link``);
+# this default keeps direct ``_link_line`` callers (and tests) unaffected.
 _LINK_LABEL = "🔗 Open in Chat"
-# Telegram-only: the summary is rendered inside an expandable blockquote
-# (collapsed by default, tap to expand), so it can show MORE than the ~140-char
-# plain/gchat snippet. Still bounded — the digest as a whole is wire-capped at
-# 4000 chars, and NEW blocks cap at DIGEST_NEW_CAP, so 280 × 10 stays safe.
-_TG_SUMMARY_CAP = 280
 
 # Priority → icon. urgent/high → 🔴, medium → 🟡, normal → 🟢, else ⚪.
 _PRIORITY_ICON = {
@@ -498,63 +503,19 @@ def _esc(text, mode: str) -> str:
     return s
 
 
-def _link_line(url, mode: str):
-    """Render the permalink line for ``mode``; None when there is no url."""
+def _link_line(url, mode: str, label: str = _LINK_LABEL):
+    """Render the permalink line for ``mode``; None when there is no url.
+
+    ``label`` is the (already-localized) static link text — never user data, never
+    escaped. Defaults to the English ``_LINK_LABEL`` so direct callers are unaffected.
+    """
     if not url:
         return None
     if mode == "gchat":
-        return f"<{url}|{_LINK_LABEL}>"
+        return f"<{url}|{label}>"
     if mode == "tg_html":
-        return f'<a href="{html.escape(url, quote=True)}">{_LINK_LABEL}</a>'
-    return f"🔗 Open: {url}"
-
-
-def _new_block(item: dict, *, now: datetime | None, mode: str, link_fn) -> str:
-    icon = _priority_icon(item)
-    sender = _bold(_esc(item.get("sender_name") or "(unknown)", mode), mode)
-    if _is_dm(item):
-        location = "Direct message"
-    else:
-        location = item.get("space_display") or item.get("space_name") or "Chat"
-    location = _esc(location, mode)
-    rel = relative_time(item.get("created_time"), now)
-    line2 = f"{location} · {rel}" if rel else location
-    lines = [f"{icon} {sender}", f"{_INDENT}{line2}"]
-
-    raw_summary = item.get("context_summary") or item.get("text")
-    if mode == "tg_html":
-        # Collapse the (often long) summary into an expandable blockquote:
-        # compact by default, tap to expand and read more. The body is
-        # html-escaped (SECURITY: an injected ``</blockquote>`` becomes
-        # ``&lt;/blockquote&gt;`` and cannot break out of the quote); the
-        # ``<blockquote expandable>`` tags are static and not escaped. Skipped
-        # when empty. The link line stays OUTSIDE the quote so it is always
-        # visible/tappable even while the quote is collapsed.
-        body = _esc(_snippet(raw_summary, _TG_SUMMARY_CAP), mode)
-        if body:
-            lines.append(f"<blockquote expandable>{body}</blockquote>")
-    else:
-        lines.append(f"{_INDENT}{_esc(_snippet(raw_summary), mode)}")
-
-    link = _link_line(link_fn(item) if link_fn else None, mode)
-    if link:
-        lines.append(f"{_INDENT}{link}")
-    return "\n".join(lines)
-
-
-def _overdue_block(item: dict, *, mode: str, link_fn) -> str:
-    sender = _bold(_esc(item.get("sender_name") or "(unknown)", mode), mode)
-    promise = _esc(item.get("my_promise") or "(unspecified)", mode)
-    due = _esc(human_due(item.get("promise_due")), mode)
-    lines = [
-        f"⏰ {sender}",
-        f'{_INDENT}promise "{promise}"',
-        f"{_INDENT}due {due}",
-    ]
-    link = _link_line(link_fn(item) if link_fn else None, mode)
-    if link:
-        lines.append(f"{_INDENT}{link}")
-    return "\n".join(lines)
+        return f'<a href="{html.escape(url, quote=True)}">{label}</a>'
+    return f"{label}: {url}"
 
 
 def render_card(
@@ -564,47 +525,42 @@ def render_card(
     now: datetime | None,
     mode: str,
     link_fn=chat_room_link,
-    cap=DIGEST_NEW_CAP,
+    cap=None,
+    templates_cfg=None,
 ) -> str:
-    """Render the per-channel 'Card' digest.
+    """Render the per-channel 'Card' digest via the config-driven template engine.
 
-    ``mode`` ∈ {'plain', 'gchat', 'tg_html'} selects the markup dialect. NEW
-    blocks are capped at ``cap`` (a trailing '…and {k} more new' block is added);
-    OVERDUE blocks are never capped (safety net). ``cap <= 0`` means no cap.
+    Thin delegation to :func:`templates.render`. ``mode`` ∈ {'plain', 'gchat',
+    'tg_html'} selects the markup dialect; ``templates_cfg`` is ``config['templates']``
+    (None → :data:`templates.DEFAULT_TEMPLATES`). ``cap`` overrides the active profile's
+    ``new_cap`` (None → profile value; ``<= 0`` → no cap). The escaping primitives
+    (``_esc`` / ``_bold`` / ``_link_line`` / ``_snippet`` …) defined above remain the
+    single security layer the engine reuses.
     """
-    n, m = len(new_items), len(esc_items)
-
-    head = ["📥 Chat triage"]
-    clauses = []
-    if n:
-        clauses.append(f"🆕 {n} new")
-    if m:
-        clauses.append(f"⏰ {m} overdue")
-    if clauses:
-        head.append(" · ".join(clauses))
-    head.append("──────────")
-    header = "\n".join(head)
-
-    blocks: list[str] = []
-    shown = new_items if cap <= 0 else new_items[:cap]
-    for it in shown:
-        blocks.append(_new_block(it, now=now, mode=mode, link_fn=link_fn))
-    if cap > 0 and n > cap:
-        blocks.append(f"…and {n - cap} more new")
-    for it in esc_items:
-        blocks.append(_overdue_block(it, mode=mode, link_fn=link_fn))
-
-    if not blocks:
-        return header
-    # Header glues directly to the first block; blocks are blank-line separated.
-    return header + "\n" + "\n\n".join(blocks)
+    return templates.render(
+        new_items,
+        esc_items,
+        now=now,
+        mode=mode,
+        templates_cfg=templates_cfg,
+        link_fn=link_fn,
+        cap=cap,
+    )
 
 
-def build_digest(new_items: list, esc_items: list, *, now=None, cap=DIGEST_NEW_CAP) -> str:
+def build_digest(
+    new_items: list, esc_items: list, *, now=None, cap=None, templates_cfg=None
+) -> str:
     """PLAIN/console Card render — the no-markup fallback used by ConsoleSender
     and the ``--dry-run`` preview. ``now`` is injected for relative times."""
     return render_card(
-        new_items, esc_items, now=now, mode="plain", link_fn=chat_room_link, cap=cap
+        new_items,
+        esc_items,
+        now=now,
+        mode="plain",
+        link_fn=chat_room_link,
+        cap=cap,
+        templates_cfg=templates_cfg,
     )
 
 
@@ -681,7 +637,7 @@ def run_once(
 
     if dry_run:
         print("[notify] DRY-RUN — would dispatch (no send, no persist):")
-        print(build_digest(notify_new, esc_cands, now=now))
+        print(build_digest(notify_new, esc_cands, now=now, templates_cfg=cfg.get("templates")))
         result["new_notified"] = [it["id"] for it in notify_new]
         result["escalated"] = [it["id"] for it in esc_cands]
         return result
