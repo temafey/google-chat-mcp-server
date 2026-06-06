@@ -34,6 +34,7 @@ import sys
 from abc import ABC, abstractmethod
 from datetime import datetime, time as dtime, timezone
 from pathlib import Path
+from string import Template
 from zoneinfo import ZoneInfo
 
 # ``scripts/`` is not an installed package; make sibling modules importable and
@@ -79,37 +80,87 @@ def _parse_iso(value) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def relative_time(iso_str, now: datetime | None) -> str:
+# English month abbreviations — the deterministic default for human_due when no locale
+# table is supplied (avoids the C-locale-dependent strftime("%b")).
+_MONTHS_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _plural_index(n: int, rule: str) -> int:
+    """CLDR-ish plural category index for ``n`` under ``rule``.
+
+    'slavic' (ru/uk): 0=one, 1=few, 2=many. Anything else: 0=one, 1=other.
+    """
+    if rule == "slavic":
+        if n % 10 == 1 and n % 100 != 11:
+            return 0  # one
+        if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+            return 1  # few
+        return 2  # many
+    return 0 if n == 1 else 1
+
+
+def _pick_form(value, n: int, rule: str) -> str:
+    """Choose a plural form. ``value`` is a string (no plural) or a list of forms.
+
+    The chosen index is clamped to the list length, so a 1- or 2-form list still works
+    under a 3-category rule.
+    """
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return ""
+        return value[min(_plural_index(n, rule), len(value) - 1)]
+    return value
+
+
+def relative_time(iso_str, now: datetime | None, loc: dict | None = None) -> str:
     """Coarse human relative age: 'just now' / '5m ago' / '2h ago' / '3d ago'.
 
     ``now`` is INJECTED (no wall-clock read here) so callers stay testable.
-    Future/garbage timestamps collapse to 'just now'.
+    Future/garbage timestamps collapse to the 'just now' label. When ``loc`` is given
+    its ``rel_just_now`` / ``rel_min`` / ``rel_hour`` / ``rel_day`` templates (each a
+    string or a list of plural forms, with a ``$count`` placeholder) and ``plural`` rule
+    drive the wording; without ``loc`` the default is abbreviated English.
     """
     dt = _parse_iso(iso_str)
     if dt is None or now is None:
         return ""
+    loc = loc or {}
+    rule = loc.get("plural", "en")
+
+    def fmt(key: str, n: int, default: str) -> str:
+        tmpl = _pick_form(loc.get(key, default), n, rule)
+        return Template(tmpl).safe_substitute(count=n)
+
     secs = (now.astimezone(timezone.utc) - dt).total_seconds()
     if secs < 60:
-        return "just now"
+        return loc.get("rel_just_now", "just now")
     mins = int(secs // 60)
     if mins < 60:
-        return f"{mins}m ago"
+        return fmt("rel_min", mins, "${count}m ago")
     hours = int(secs // 3600)
     if hours < 24:
-        return f"{hours}h ago"
+        return fmt("rel_hour", hours, "${count}h ago")
     days = int(secs // 86400)
-    return f"{days}d ago"
+    return fmt("rel_day", days, "${count}d ago")
 
 
-def human_due(iso_str) -> str:
-    """Human due date, e.g. '04 Jun 18:00' (UTC, deterministic). '(no due date)'
-    when absent / unparseable falls back to the raw string."""
+def human_due(iso_str, loc: dict | None = None) -> str:
+    """Human due date, e.g. '04 Jun 18:00' (UTC, deterministic).
+
+    Month abbreviations come from ``loc['months']`` (12-entry list) when supplied, else
+    English. The localized ``loc['no_due']`` (default '(no due date)') is returned when
+    the date is absent; an unparseable value falls back to its raw string.
+    """
+    loc = loc or {}
     if not iso_str:
-        return "(no due date)"
+        return loc.get("no_due", "(no due date)")
     dt = _parse_iso(iso_str)
     if dt is None:
         return str(iso_str)
-    return dt.strftime("%d %b %H:%M")
+    months = loc.get("months") or _MONTHS_EN
+    mon = months[dt.month - 1] if len(months) == 12 else _MONTHS_EN[dt.month - 1]
+    return f"{dt.day:02d} {mon} {dt.hour:02d}:{dt.minute:02d}"
 
 
 def _parse_hhmm(value: str) -> dtime:

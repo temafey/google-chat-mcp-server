@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import copy
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -56,7 +56,7 @@ def _tcfg(**over) -> dict:
 def test_locale_ru_labels_render():
     card = notify.render_card([_item()], [], now=NOW, mode="plain", templates_cfg=_tcfg(locale="ru"))
     assert "📥 Триаж чатов" in card
-    assert "🆕 1 новых" in card
+    assert "🆕 1 новое" in card  # 'one' plural form
     assert "Исходное сообщение" in card  # localized "Original message"
     assert "🔗 Открыть в чате:" in card  # localized link label
 
@@ -64,7 +64,7 @@ def test_locale_ru_labels_render():
 def test_locale_uk_labels_render():
     card = notify.render_card([_item()], [], now=NOW, mode="plain", templates_cfg=_tcfg(locale="uk"))
     assert "📥 Тріаж чатів" in card
-    assert "🆕 1 нових" in card
+    assert "🆕 1 нове" in card  # 'one' plural form
     assert "Оригінальне повідомлення" in card  # localized "Original message"
     assert "🔗 Відкрити в чаті:" in card  # localized link label
 
@@ -278,3 +278,97 @@ def test_load_config_upgrades_partial_templates(tmp_path):
     assert merged["templates"]["active_profile"] == "compact"  # user value preserved
     assert "default" in merged["templates"]["profiles"]  # default profiles filled in
     assert merged["templates"]["locales"]["ru"]["header_title"] == "📥 Триаж чатов"
+
+
+# --------------------------------------------------------------------------- #
+# Localized dates + declensions (plurals).
+# --------------------------------------------------------------------------- #
+RU = templates._locale({"locale": "ru"})
+UK = templates._locale({"locale": "uk"})
+EN = templates._locale({"locale": "en"})
+
+
+def _ago(**kw) -> str:
+    return (NOW - timedelta(**kw)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_plural_index_slavic_categories():
+    # one / few / many → 0 / 1 / 2 under the CLDR-ish slavic rule.
+    assert [notify._plural_index(n, "slavic") for n in (1, 21, 31)] == [0, 0, 0]
+    assert [notify._plural_index(n, "slavic") for n in (2, 3, 4, 22)] == [1, 1, 1, 1]
+    assert [notify._plural_index(n, "slavic") for n in (5, 11, 12, 14, 25)] == [2, 2, 2, 2, 2]
+
+
+def test_plural_index_english_is_one_other():
+    assert notify._plural_index(1, "en") == 0
+    assert notify._plural_index(2, "en") == 1
+
+
+def test_relative_time_english_default_unchanged():
+    assert notify.relative_time(_ago(seconds=10), NOW) == "just now"
+    assert notify.relative_time(_ago(minutes=30), NOW) == "30m ago"
+    assert notify.relative_time(_ago(hours=2), NOW) == "2h ago"
+    assert notify.relative_time(_ago(days=3), NOW) == "3d ago"
+
+
+def test_relative_time_localized_ru_declensions():
+    assert notify.relative_time(_ago(seconds=5), NOW, RU) == "только что"
+    assert notify.relative_time(_ago(minutes=1), NOW, RU) == "1 минуту назад"
+    assert notify.relative_time(_ago(minutes=2), NOW, RU) == "2 минуты назад"
+    assert notify.relative_time(_ago(minutes=5), NOW, RU) == "5 минут назад"
+    assert notify.relative_time(_ago(hours=2), NOW, RU) == "2 часа назад"
+    assert notify.relative_time(_ago(days=5), NOW, RU) == "5 дней назад"
+
+
+def test_relative_time_localized_uk_declensions():
+    assert notify.relative_time(_ago(seconds=5), NOW, UK) == "щойно"
+    assert notify.relative_time(_ago(minutes=1), NOW, UK) == "1 хвилину тому"
+    assert notify.relative_time(_ago(minutes=3), NOW, UK) == "3 хвилини тому"
+    assert notify.relative_time(_ago(minutes=5), NOW, UK) == "5 хвилин тому"
+
+
+def test_human_due_localized_months():
+    due = "2026-06-03T15:00:00Z"
+    assert notify.human_due(due, EN) == "03 Jun 15:00"
+    assert notify.human_due(due, RU) == "03 июн 15:00"
+    assert notify.human_due(due, UK) == "03 чер 15:00"
+
+
+def test_human_due_localized_no_due():
+    assert notify.human_due(None, RU) == "(без срока)"
+    assert notify.human_due(None, UK) == "(без терміну)"
+    assert notify.human_due(None) == "(no due date)"
+
+
+def test_header_count_declensions_ru():
+    def hdr(count):
+        items = [_item(f"n{i}", priority="normal") for i in range(count)]
+        return notify.render_card(items, [], now=NOW, mode="plain", templates_cfg=_tcfg(locale="ru"))
+    assert "🆕 1 новое" in hdr(1)   # one
+    assert "🆕 2 новых" in hdr(2)   # few
+    assert "🆕 5 новых" in hdr(5)   # many
+
+
+def test_header_count_declensions_uk():
+    def hdr(count):
+        items = [_item(f"n{i}", priority="normal") for i in range(count)]
+        return notify.render_card(items, [], now=NOW, mode="plain", templates_cfg=_tcfg(locale="uk"))
+    assert "🆕 1 нове" in hdr(1)    # one
+    assert "🆕 2 нові" in hdr(2)    # few
+    assert "🆕 5 нових" in hdr(5)   # many
+
+
+def test_more_new_line_is_declined():
+    items = [_item(f"n{i}", priority="normal") for i in range(12)]  # default cap 10 → 2 more
+    card = notify.render_card(items, [], now=NOW, mode="plain", templates_cfg=_tcfg(locale="uk"))
+    assert "…та ще 2 нові" in card  # 'few' form for the remainder
+
+
+def test_overdue_block_uses_localized_month_and_reltime():
+    overdue = _item(
+        "o0",
+        my_promise="ship the build",
+        promise_due="2026-06-03T15:00:00Z",
+    )
+    card = notify.render_card([], [overdue], now=NOW, mode="plain", templates_cfg=_tcfg(locale="ru"))
+    assert "до 03 июн 15:00" in card

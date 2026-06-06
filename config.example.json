@@ -39,6 +39,7 @@
     "locale": "en",
     "locales": {
       "en": {
+        "plural": "en",
         "header_title": "📥 Chat triage",
         "new_clause": "🆕 $count new",
         "overdue_clause": "⏰ $count overdue",
@@ -49,33 +50,129 @@
         "original_message": "Original message",
         "promise_label": "promise",
         "due_label": "due",
-        "no_due": "(no due date)"
+        "no_due": "(no due date)",
+        "months": [
+          "Jan",
+          "Feb",
+          "Mar",
+          "Apr",
+          "May",
+          "Jun",
+          "Jul",
+          "Aug",
+          "Sep",
+          "Oct",
+          "Nov",
+          "Dec"
+        ],
+        "rel_just_now": "just now",
+        "rel_min": "${count}m ago",
+        "rel_hour": "${count}h ago",
+        "rel_day": "${count}d ago"
       },
       "ru": {
+        "plural": "slavic",
         "header_title": "📥 Триаж чатов",
-        "new_clause": "🆕 $count новых",
+        "new_clause": [
+          "🆕 $count новое",
+          "🆕 $count новых",
+          "🆕 $count новых"
+        ],
         "overdue_clause": "⏰ $count просрочено",
-        "more_new": "…и ещё $count новых",
+        "more_new": [
+          "…и ещё $count новое",
+          "…и ещё $count новых",
+          "…и ещё $count новых"
+        ],
         "direct_message": "Личное сообщение",
         "unknown_sender": "(неизвестно)",
         "open_link": "🔗 Открыть в чате",
         "original_message": "Исходное сообщение",
         "promise_label": "обещание",
         "due_label": "до",
-        "no_due": "(без срока)"
+        "no_due": "(без срока)",
+        "months": [
+          "янв",
+          "фев",
+          "мар",
+          "апр",
+          "май",
+          "июн",
+          "июл",
+          "авг",
+          "сен",
+          "окт",
+          "ноя",
+          "дек"
+        ],
+        "rel_just_now": "только что",
+        "rel_min": [
+          "$count минуту назад",
+          "$count минуты назад",
+          "$count минут назад"
+        ],
+        "rel_hour": [
+          "$count час назад",
+          "$count часа назад",
+          "$count часов назад"
+        ],
+        "rel_day": [
+          "$count день назад",
+          "$count дня назад",
+          "$count дней назад"
+        ]
       },
       "uk": {
+        "plural": "slavic",
         "header_title": "📥 Тріаж чатів",
-        "new_clause": "🆕 $count нових",
+        "new_clause": [
+          "🆕 $count нове",
+          "🆕 $count нові",
+          "🆕 $count нових"
+        ],
         "overdue_clause": "⏰ $count прострочено",
-        "more_new": "…та ще $count нових",
+        "more_new": [
+          "…та ще $count нове",
+          "…та ще $count нові",
+          "…та ще $count нових"
+        ],
         "direct_message": "Особисте повідомлення",
         "unknown_sender": "(невідомо)",
         "open_link": "🔗 Відкрити в чаті",
         "original_message": "Оригінальне повідомлення",
         "promise_label": "обіцянка",
         "due_label": "до",
-        "no_due": "(без терміну)"
+        "no_due": "(без терміну)",
+        "months": [
+          "січ",
+          "лют",
+          "бер",
+          "кві",
+          "тра",
+          "чер",
+          "лип",
+          "сер",
+          "вер",
+          "жов",
+          "лис",
+          "гру"
+        ],
+        "rel_just_now": "щойно",
+        "rel_min": [
+          "$count хвилину тому",
+          "$count хвилини тому",
+          "$count хвилин тому"
+        ],
+        "rel_hour": [
+          "$count годину тому",
+          "$count години тому",
+          "$count годин тому"
+        ],
+        "rel_day": [
+          "$count день тому",
+          "$count дні тому",
+          "$count днів тому"
+        ]
       }
     },
     "profiles": {

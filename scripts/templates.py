@@ -47,6 +47,7 @@ DEFAULT_TEMPLATES: dict = {
     "locale": "en",
     "locales": {
         "en": {
+            "plural": "en",
             "header_title": "📥 Chat triage",
             "new_clause": "🆕 $count new",
             "overdue_clause": "⏰ $count overdue",
@@ -58,12 +59,21 @@ DEFAULT_TEMPLATES: dict = {
             "promise_label": "promise",
             "due_label": "due",
             "no_due": "(no due date)",
+            "months": ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+            "rel_just_now": "just now",
+            "rel_min": "${count}m ago",
+            "rel_hour": "${count}h ago",
+            "rel_day": "${count}d ago",
         },
         "ru": {
+            # Slavic plurals: count-bearing labels are 3-form lists [one, few, many]
+            # (e.g. 1 новое · 2 новых · 5 новых), picked by notify._plural_index.
+            "plural": "slavic",
             "header_title": "📥 Триаж чатов",
-            "new_clause": "🆕 $count новых",
+            "new_clause": ["🆕 $count новое", "🆕 $count новых", "🆕 $count новых"],
             "overdue_clause": "⏰ $count просрочено",
-            "more_new": "…и ещё $count новых",
+            "more_new": ["…и ещё $count новое", "…и ещё $count новых", "…и ещё $count новых"],
             "direct_message": "Личное сообщение",
             "unknown_sender": "(неизвестно)",
             "open_link": "🔗 Открыть в чате",
@@ -71,12 +81,19 @@ DEFAULT_TEMPLATES: dict = {
             "promise_label": "обещание",
             "due_label": "до",
             "no_due": "(без срока)",
+            "months": ["янв", "фев", "мар", "апр", "май", "июн",
+                       "июл", "авг", "сен", "окт", "ноя", "дек"],
+            "rel_just_now": "только что",
+            "rel_min": ["$count минуту назад", "$count минуты назад", "$count минут назад"],
+            "rel_hour": ["$count час назад", "$count часа назад", "$count часов назад"],
+            "rel_day": ["$count день назад", "$count дня назад", "$count дней назад"],
         },
         "uk": {
+            "plural": "slavic",
             "header_title": "📥 Тріаж чатів",
-            "new_clause": "🆕 $count нових",
+            "new_clause": ["🆕 $count нове", "🆕 $count нові", "🆕 $count нових"],
             "overdue_clause": "⏰ $count прострочено",
-            "more_new": "…та ще $count нових",
+            "more_new": ["…та ще $count нове", "…та ще $count нові", "…та ще $count нових"],
             "direct_message": "Особисте повідомлення",
             "unknown_sender": "(невідомо)",
             "open_link": "🔗 Відкрити в чаті",
@@ -84,6 +101,12 @@ DEFAULT_TEMPLATES: dict = {
             "promise_label": "обіцянка",
             "due_label": "до",
             "no_due": "(без терміну)",
+            "months": ["січ", "лют", "бер", "кві", "тра", "чер",
+                       "лип", "сер", "вер", "жов", "лис", "гру"],
+            "rel_just_now": "щойно",
+            "rel_min": ["$count хвилину тому", "$count хвилини тому", "$count хвилин тому"],
+            "rel_hour": ["$count годину тому", "$count години тому", "$count годин тому"],
+            "rel_day": ["$count день тому", "$count дні тому", "$count днів тому"],
         },
     },
     "profiles": {
@@ -233,7 +256,7 @@ def render(
     active = _profile(tcfg, tcfg.get("active_profile") or "default")
 
     n, m = len(new_items), len(esc_items)
-    header = _render_header(active, loc, n, m)
+    header = _render_header(active, loc, n, m, notify=notify)
 
     new_cap = active.get("new_cap", notify.DIGEST_NEW_CAP) if cap is None else cap
     if new_cap is None or new_cap <= 0:
@@ -241,12 +264,15 @@ def render(
     else:
         shown, capped = new_items[:new_cap], True
 
+    rule = loc.get("plural", "en")
+
     blocks: list[str] = []
     for it in shown:
         prof = _profile(tcfg, _variant_profile_name(it, tcfg))
         blocks.append(_render_new_block(it, prof, loc, now=now, mode=mode, link_fn=link_fn, notify=notify))
     if capped and n > new_cap:
-        blocks.append(Template(loc["more_new"]).safe_substitute(count=n - new_cap))
+        rest = n - new_cap
+        blocks.append(Template(notify._pick_form(loc["more_new"], rest, rule)).safe_substitute(count=rest))
     for it in esc_items:
         prof = _profile(tcfg, _variant_profile_name(it, tcfg))
         blocks.append(_render_overdue_block(it, prof, loc, mode=mode, link_fn=link_fn, notify=notify))
@@ -256,12 +282,13 @@ def render(
     return header + "\n" + "\n\n".join(blocks)
 
 
-def _render_header(prof: dict, loc: dict, n: int, m: int) -> str:
+def _render_header(prof: dict, loc: dict, n: int, m: int, *, notify) -> str:
+    rule = loc.get("plural", "en")
     clauses = []
     if n:
-        clauses.append(Template(loc["new_clause"]).safe_substitute(count=n))
+        clauses.append(Template(notify._pick_form(loc["new_clause"], n, rule)).safe_substitute(count=n))
     if m:
-        clauses.append(Template(loc["overdue_clause"]).safe_substitute(count=m))
+        clauses.append(Template(notify._pick_form(loc["overdue_clause"], m, rule)).safe_substitute(count=m))
     counts = (prof.get("counts_sep") or " · ").join(clauses)
     out = Template(prof["header"]).safe_substitute(
         title=loc["header_title"], counts=counts, divider=prof.get("divider", "")
@@ -282,7 +309,7 @@ def _render_new_block(item, prof, loc, *, now, mode, link_fn, notify) -> str:
     else:
         location = item.get("space_display") or item.get("space_name") or "Chat"
     location = esc(location, mode)
-    reltime = notify.relative_time(item.get("created_time"), now)
+    reltime = notify.relative_time(item.get("created_time"), now, loc)
 
     tg_cap = prof.get("tg_summary_cap", 280)
 
@@ -310,9 +337,7 @@ def _render_overdue_block(item, prof, loc, *, mode, link_fn, notify) -> str:
     esc = notify._esc
     sender = notify._bold(esc(item.get("sender_name") or loc["unknown_sender"], mode), mode)
     promise = esc(item.get("my_promise") or "(unspecified)", mode)
-    due_raw = notify.human_due(item.get("promise_due"))
-    if due_raw == "(no due date)":
-        due_raw = loc["no_due"]
+    due_raw = notify.human_due(item.get("promise_due"), loc)
     mapping = {
         "icon": "⏰",
         "sender": sender,
