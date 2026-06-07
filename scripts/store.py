@@ -126,6 +126,12 @@ def _new_item_skeleton() -> dict:
         "response_text": None,
         "answered_at": None,
         "last_notified": None,
+        # Pin ("starred"): an orthogonal user flag — NOT a status. A pinned open
+        # item rides along on every digest until unpinned (see notify.run_once).
+        # Toggled via store.set_fields (verbatim, no status churn); absent on
+        # pre-existing on-disk items, where .get("pinned") is falsy.
+        "pinned": False,
+        "pinned_at": None,
         "stale": False,
         "history": [],
     }

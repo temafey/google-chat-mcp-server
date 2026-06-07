@@ -148,8 +148,11 @@ DEFAULT_TEMPLATES: dict = {
         },
     },
     # Per-item profile overrides. First entry whose every ``when`` field matches the item
-    # wins. Supported fields: priority, space_name (≈ project), space_type, trigger (≈ type).
+    # wins. Supported fields: pinned, priority, space_name (≈ project), space_type,
+    # trigger (≈ type). The pinned rule is FIRST so a pinned item always renders with the
+    # louder ``detailed`` profile, regardless of its priority.
     "variants": [
+        {"when": {"pinned": [True]}, "profile": "detailed"},
         {"when": {"priority": ["urgent", "high"]}, "profile": "detailed"},
     ],
 }
@@ -302,7 +305,10 @@ def _render_new_block(item, prof, loc, *, now, mode, link_fn, notify) -> str:
     summary_src = item.get("context_summary") or item.get("text")
     has_summary = bool((item.get("context_summary") or "").strip())
 
-    icon = notify._priority_icon(item)
+    # A pinned ("starred") item gets the 📌 marker, overriding the priority icon,
+    # so it is visually distinct when it rides along on a digest (see
+    # notify.pinned_candidates / run_once).
+    icon = "📌" if item.get("pinned") else notify._priority_icon(item)
     sender = notify._bold(esc(item.get("sender_name") or loc["unknown_sender"], mode), mode)
     if notify._is_dm(item):
         location = loc["direct_message"]

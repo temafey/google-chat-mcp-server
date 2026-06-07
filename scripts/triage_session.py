@@ -225,6 +225,24 @@ def record_response(store, item_id: str, *, response_text, response_posted, now=
     return _persisted(store, item_id, path)
 
 
+def pin(store, item_id: str, *, now=None, path=None) -> dict:
+    """Pin ("star") an item so it rides along on every digest until unpinned.
+
+    Pinning is ORTHOGONAL to the status machine — it never changes ``status``.
+    We therefore write the flag via ``store.set_fields`` (verbatim, no status
+    transition, no history entry), mirroring how the notifier records
+    ``last_notified``. ``KeyError`` propagates for an unknown id.
+    """
+    _store.set_fields(store, item_id, pinned=True, pinned_at=_iso(now))
+    return _persisted(store, item_id, path)
+
+
+def unpin(store, item_id: str, *, now=None, path=None) -> dict:
+    """Clear an item's pin flag (the inverse of :func:`pin`)."""
+    _store.set_fields(store, item_id, pinned=False, pinned_at=None)
+    return _persisted(store, item_id, path)
+
+
 def close_item(store, item_id: str, *, now=None, path=None) -> dict:
     """Transition an item to the terminal ``closed`` status."""
     _store.set_status(store, item_id, "closed", now=now)

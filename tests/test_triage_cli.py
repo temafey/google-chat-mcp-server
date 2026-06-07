@@ -250,6 +250,50 @@ def test_promise_records_due(store_path, capsys):
     assert item["promise_due"] == "2026-06-09T17:00:00Z"
 
 
+def test_pin_and_unpin_toggle_flag(store_path, capsys):
+    iid = _seed(store_path, "m1")
+
+    assert _run(store_path, "pin", iid) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"id": iid, "pinned": True}
+    item = store.load(store_path)["items"][iid]
+    assert item["pinned"] is True
+    assert item["pinned_at"] is not None
+    assert item["status"] == "new"  # pin is orthogonal to status
+
+    assert _run(store_path, "unpin", iid) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"id": iid, "pinned": False}
+    item = store.load(store_path)["items"][iid]
+    assert item["pinned"] is False
+    assert item["pinned_at"] is None
+
+
+def test_pin_unknown_id_exits_2(store_path, capsys):
+    _seed(store_path, "m1")
+    assert _run(store_path, "pin", "deadbeefdeadbeef") == 2
+    assert "unknown item id" in capsys.readouterr().err
+
+
+def test_list_json_carries_pinned_flag(store_path, config_path, capsys):
+    iid = _seed(store_path, "m1")
+    _run(store_path, "pin", iid)
+    capsys.readouterr()  # drain the pin output
+
+    _run(store_path, "list", "--json", config_path=config_path)
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["pinned"] is True
+
+
+def test_list_human_shows_pin_marker(store_path, config_path, capsys):
+    iid = _seed(store_path, "m1")
+    _run(store_path, "pin", iid)
+    capsys.readouterr()
+
+    _run(store_path, "list", config_path=config_path)
+    assert "📌" in capsys.readouterr().out
+
+
 def test_close_and_ignore_are_terminal(store_path, capsys):
     a = _seed(store_path, "a")
     b = _seed(store_path, "b")

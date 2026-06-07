@@ -128,6 +128,7 @@ def _cmd_list(args) -> int:
                 "thread_name": it.get("thread_name"),
                 "created_time": it.get("created_time"),
                 "status": it.get("status"),
+                "pinned": bool(it.get("pinned")),
                 "text": it.get("text"),
             }
             for it in queue
@@ -139,7 +140,9 @@ def _cmd_list(args) -> int:
         print("(no items to triage)")
         return 0
     for it in queue:
+        pin = "📌" if it.get("pinned") else "  "
         print(
+            f"{pin} "
             f"{(it.get('id') or '')[:12]:12}  "
             f"{(it.get('priority') or '-'):6}  "
             f"{(it.get('trigger') or '-'):12}  "
@@ -283,6 +286,28 @@ def _cmd_promise(args) -> int:
     return 0
 
 
+def _cmd_pin(args) -> int:
+    store_data = store.load(args.store_path)
+    item_id = _resolve_id(store_data, args.id)
+    if item_id is None:
+        _err(f"error: unknown item id {args.id!r}")
+        return 2
+    item = triage_session.pin(store_data, item_id, path=args.store_path)
+    _print_json({"id": item_id, "pinned": item.get("pinned")})
+    return 0
+
+
+def _cmd_unpin(args) -> int:
+    store_data = store.load(args.store_path)
+    item_id = _resolve_id(store_data, args.id)
+    if item_id is None:
+        _err(f"error: unknown item id {args.id!r}")
+        return 2
+    item = triage_session.unpin(store_data, item_id, path=args.store_path)
+    _print_json({"id": item_id, "pinned": item.get("pinned")})
+    return 0
+
+
 def _cmd_close(args) -> int:
     store_data = store.load(args.store_path)
     item_id = _resolve_id(store_data, args.id)
@@ -362,6 +387,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_promise.add_argument("--text", required=True)
     p_promise.add_argument("--due", required=True)
     p_promise.set_defaults(func=_cmd_promise)
+
+    p_pin = sub.add_parser("pin", help="pin ('star') an item so it rides every digest")
+    p_pin.add_argument("id")
+    p_pin.set_defaults(func=_cmd_pin)
+
+    p_unpin = sub.add_parser("unpin", help="clear an item's pin flag")
+    p_unpin.add_argument("id")
+    p_unpin.set_defaults(func=_cmd_unpin)
 
     p_close = sub.add_parser("close", help="close an item (terminal)")
     p_close.add_argument("id")

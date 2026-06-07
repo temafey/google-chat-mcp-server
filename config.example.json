@@ -210,6 +210,14 @@
     "variants": [
       {
         "when": {
+          "pinned": [
+            true
+          ]
+        },
+        "profile": "detailed"
+      },
+      {
+        "when": {
           "priority": [
             "urgent",
             "high"

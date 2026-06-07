@@ -131,6 +131,102 @@ def test_already_notified_not_renotified(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Pin piggyback.
+# --------------------------------------------------------------------------- #
+def test_pinned_item_rides_along_but_not_marked_notified(tmp_path):
+    # A DM fires the digest (baseline); a plain pinned broadcast is NOT a baseline
+    # candidate on its own, but rides along because the digest is already firing.
+    trigger_item = _item("dm", trigger="direct_dm")
+    pinned = _item("pin", trigger="broadcast", text="plain note", pinned=True)
+    st = _store(trigger_item, pinned)
+    sender = FakeSender()
+
+    res = notify.run_once(
+        st, _cfg(), now=ACTIVE_NOW, senders=[sender], store_path=tmp_path / "s.json",
+    )
+
+    dispatched_ids = {it["id"] for it in sender.calls[0][0]}
+    assert dispatched_ids == {"dm", "pin"}            # pin rode along
+    assert res["pinned_ridealong"] == ["pin"]
+    # The pin is NEVER marked notified — it reappears every cycle until unpinned.
+    assert "pin" not in res["new_notified"]
+    assert st["items"]["pin"]["last_notified"] is None
+    assert st["items"]["dm"]["last_notified"] is not None
+
+
+def test_pinned_item_alone_never_forces_send(tmp_path):
+    # Nothing else is firing — a lone pin must NOT trigger a digest.
+    pinned = _item("pin", trigger="broadcast", text="plain note", pinned=True)
+    st = _store(pinned)
+    sender = FakeSender()
+
+    res = notify.run_once(
+        st, _cfg(), now=ACTIVE_NOW, senders=[sender], store_path=tmp_path / "s.json",
+    )
+
+    assert sender.calls == []                          # nothing dispatched
+    assert res["pinned_ridealong"] == []
+    assert st["items"]["pin"]["last_notified"] is None
+
+
+def test_pinned_candidate_not_duplicated(tmp_path):
+    # An item that is BOTH a baseline NEW candidate AND pinned appears once, and is
+    # marked notified normally (it is not a ride-along).
+    pinned_dm = _item("dm", trigger="direct_dm", pinned=True)
+    st = _store(pinned_dm)
+    sender = FakeSender()
+
+    res = notify.run_once(
+        st, _cfg(), now=ACTIVE_NOW, senders=[sender], store_path=tmp_path / "s.json",
+    )
+
+    dispatched_ids = [it["id"] for it in sender.calls[0][0]]
+    assert dispatched_ids.count("dm") == 1             # not duplicated
+    assert res["pinned_ridealong"] == []               # already a NEW candidate
+    assert "dm" in res["new_notified"]
+    assert st["items"]["dm"]["last_notified"] is not None
+
+
+def test_pinned_closed_item_is_inert(tmp_path):
+    # A pin on a terminal (closed) item never rides along — pins follow open items.
+    trigger_item = _item("dm", trigger="direct_dm")
+    pinned_closed = _item("pinc", trigger="broadcast", text="x", pinned=True, status="closed")
+    st = _store(trigger_item, pinned_closed)
+    sender = FakeSender()
+
+    res = notify.run_once(
+        st, _cfg(), now=ACTIVE_NOW, senders=[sender], store_path=tmp_path / "s.json",
+    )
+
+    dispatched_ids = {it["id"] for it in sender.calls[0][0]}
+    assert "pinc" not in dispatched_ids
+    assert res["pinned_ridealong"] == []
+
+
+def test_pinned_item_suppressed_in_quiet_hours(tmp_path):
+    # During quiet hours only the escalation safety net speaks; pins behave like
+    # NEW items and are suppressed (they do NOT ride along on an escalation).
+    now_quiet = datetime(2026, 6, 4, 23, 0, tzinfo=KIEV)  # inside default 22:00–08:00
+    overdue = _item(
+        "ovd", status="awaiting_me", my_promise="send report",
+        promise_due="2026-06-04T10:00:00Z",  # < now → overdue
+    )
+    pinned = _item("pin", trigger="broadcast", text="plain note", pinned=True)
+    st = _store(overdue, pinned)
+    sender = FakeSender()
+
+    res = notify.run_once(
+        st, _cfg(), now=now_quiet, senders=[sender], store_path=tmp_path / "s.json",
+    )
+
+    assert "ovd" in res["escalated"]                   # safety net still fires
+    dispatched_ids = {it["id"] for it in sender.calls[0][0]}
+    assert "pin" not in dispatched_ids                 # pin suppressed in quiet hours
+    assert res["pinned_ridealong"] == []
+    assert st["items"]["pin"]["last_notified"] is None
+
+
+# --------------------------------------------------------------------------- #
 # Escalation.
 # --------------------------------------------------------------------------- #
 def test_overdue_escalates_then_not_again(tmp_path):

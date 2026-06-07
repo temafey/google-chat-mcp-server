@@ -138,6 +138,41 @@ async def test_someone_elses_mention_not_detected():
     assert items == []
 
 
+async def test_add_membership_annotation_is_not_a_mention():
+    """A userMention with type ADD is a membership event (I was ADDED to the
+    space), NOT an @mention of me — it must not surface as a triage item."""
+    msgs = {"spaces/TEAM": [_msg("M3a", "spaces/TEAM", "added you to the room",
+                                 annotations=[_mention_ann(ME, mtype="ADD")])]}
+    with _patched([SPACE_TEAM], msgs):
+        items = await mentions_core.list_messages_for_me(START, END)
+
+    assert items == []
+
+
+async def test_real_mention_alongside_add_still_detected():
+    """An ADD annotation does not mask a genuine @mention in the same message."""
+    msgs = {"spaces/TEAM": [_msg("M3b", "spaces/TEAM", "welcome @Artem",
+                                 annotations=[_mention_ann(OTHER, mtype="ADD"),
+                                              _mention_ann(ME, mtype="MENTION")])]}
+    with _patched([SPACE_TEAM], msgs):
+        items = await mentions_core.list_messages_for_me(START, END)
+
+    assert len(items) == 1
+    assert items[0]["trigger"] == "user_mention"
+
+
+async def test_unspecified_mention_type_treated_as_mention():
+    """A missing/empty userMention.type is treated permissively as a mention
+    (forward-compatible — only ADD is excluded)."""
+    msgs = {"spaces/TEAM": [_msg("M3c", "spaces/TEAM", "@Artem ping",
+                                 annotations=[_mention_ann(ME, mtype="")])]}
+    with _patched([SPACE_TEAM], msgs):
+        items = await mentions_core.list_messages_for_me(START, END)
+
+    assert len(items) == 1
+    assert items[0]["trigger"] == "user_mention"
+
+
 async def test_direct_message_detected():
     msgs = {"spaces/DM": [_msg("M4", "spaces/DM", "hey, free for a call?")]}
     with _patched([SPACE_DM], msgs):

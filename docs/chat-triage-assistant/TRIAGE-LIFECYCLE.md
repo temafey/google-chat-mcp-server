@@ -117,6 +117,31 @@ A `snoozed` item with `snooze_until` still in the future is omitted entirely.
 - Notifier bookkeeping (`last_notified`, `promise_escalated_at`) is written via
   `set_fields` — **no status change, no history entry**.
 
+## Pin ("star") — an orthogonal flag, NOT a status
+
+Google Chat's **Starred** section is not readable via the public REST API, so we
+provide our own equivalent: a `pinned` boolean on the item (`pinned` / `pinned_at`,
+default `False`). Pinning is **orthogonal to the seven-status machine** — it never
+changes `status`. Like the notifier bookkeeping above, it is written via
+`store.set_fields` (**verbatim, no status transition, no history entry**).
+
+- **Set it:** `triage_cli pin <id>` / clear it: `triage_cli unpin <id>`
+  (delegates to `triage_session.pin` / `unpin`). The `list` view shows a `📌` marker
+  and the `--json` rows carry a `pinned` field.
+- **What it does — piggyback, not a trigger** (`notify.run_once`): a pinned **open**
+  item **rides along** on any digest that is *already* firing for another reason. It:
+  - **never forces a lone send** — if nothing else is firing, a pin stays silent;
+  - **is never marked `last_notified`** — so it reappears on every subsequent digest
+    until you `unpin` it (or it leaves the open set);
+  - is **de-duped** against the cycle's NEW/escalation candidates (no double line);
+  - is **suppressed in quiet hours** exactly like a NEW item (only the overdue-promise
+    escalation safety net speaks during quiet hours).
+- **Rendering:** a pinned item shows the `📌` icon (overriding its priority icon) and is
+  routed to the louder `detailed` profile via the shipped `{"pinned": [true]}` variant
+  (`scripts/templates.py`).
+- A pin on a **terminal** (`closed` / `ignored`) item is inert — ride-along follows
+  `store.open_items`.
+
 ---
 
 ## What "Phase C" tests (the phase we stopped at)

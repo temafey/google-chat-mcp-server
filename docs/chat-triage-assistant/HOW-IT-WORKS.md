@@ -55,6 +55,13 @@ flowchart LR
 Active policy = **Variant A**: keep `user_mention` + `direct_dm` (from others); drop my own
 messages. A DM from another person IS "to me".
 
+**ADD ≠ @mention:** a `USER_MENTION` annotation whose `userMention.type == "ADD"` is a
+*membership event* (I was **added** to the space), not an @mention. `mentions_core`
+skips `ADD` userMentions (`_is_real_mention`), so being added to a room no longer
+mis-classifies as a `user_mention`. An absent/unspecified type is treated permissively
+as a mention (forward-compatible); only `ADD` is excluded. Verified against the Chat API
+`UserMentionMetadata.Type` enum, 2026-06-07.
+
 **Why a dedicated raw fetch (R8):** `list_space_messages` strips messages to
 `{sender,createTime,text,thread}` under `SAVE_TOKEN_MODE`, discarding the `annotations`
 needed for mention detection. The core uses `google_chat._list_messages_sync` (raw payload).

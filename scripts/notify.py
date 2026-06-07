@@ -245,6 +245,17 @@ def escalation_candidates(store_data: dict, now: datetime) -> list:
     ]
 
 
+def pinned_candidates(store_data: dict) -> list:
+    """OPEN items the user has pinned (``pinned`` truthy).
+
+    These RIDE ALONG on any digest that is already firing (see :func:`run_once`):
+    they never force a lone send, are never marked notified, and reappear every
+    cycle until unpinned. ``closed`` / ``ignored`` items are not open, so a pin on
+    a finished item is silently inert.
+    """
+    return [it for it in store.open_items(store_data) if it.get("pinned")]
+
+
 # --------------------------------------------------------------------------- #
 # Sender plugin architecture.
 # --------------------------------------------------------------------------- #
@@ -657,6 +668,7 @@ def run_once(
         "new_notified": [],
         "escalated": [],
         "suppressed_quiet": [],
+        "pinned_ridealong": [],
         "senders_succeeded": [],
     }
 
@@ -683,18 +695,35 @@ def run_once(
 
     to_dispatch = notify_new + esc_cands
     if not to_dispatch:
+        # Pins NEVER force a lone send — with nothing else firing, a pinned item
+        # stays silent and simply waits for the next digest that has its own
+        # reason to fire. (Piggyback, not a trigger.)
         print("[notify] no candidates to notify")
         return result
 
+    # Pin piggyback: pinned OPEN items ride along on a digest that is ALREADY
+    # firing. They are NOT marked notified (so they reappear every cycle until
+    # unpinned), are de-duped against this cycle's NEW/escalation candidates, and
+    # are suppressed in quiet hours exactly like NEW items (only the escalation
+    # safety net speaks during quiet hours).
+    present_ids = {it["id"] for it in to_dispatch}
+    ride_pins = (
+        []
+        if quiet
+        else [it for it in pinned_candidates(store_data) if it["id"] not in present_ids]
+    )
+    render_new = notify_new + ride_pins
+    result["pinned_ridealong"] = [it["id"] for it in ride_pins]
+
     if dry_run:
         print("[notify] DRY-RUN — would dispatch (no send, no persist):")
-        print(build_digest(notify_new, esc_cands, now=now, templates_cfg=cfg.get("templates")))
+        print(build_digest(render_new, esc_cands, now=now, templates_cfg=cfg.get("templates")))
         result["new_notified"] = [it["id"] for it in notify_new]
         result["escalated"] = [it["id"] for it in esc_cands]
         return result
 
     active = build_senders(cfg) if senders is None else senders
-    succeeded = _dispatch(active, notify_new, esc_cands, now)
+    succeeded = _dispatch(active, render_new, esc_cands, now)
     result["senders_succeeded"] = succeeded
 
     # Mark notified iff at least one sender succeeded.

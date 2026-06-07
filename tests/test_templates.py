@@ -151,6 +151,28 @@ def test_default_variant_routes_high_priority_to_detailed():
     assert card.count("Z") > 280  # detailed cap applied via the variant
 
 
+def test_pinned_item_renders_pin_icon_override():
+    # A pinned item gets 📌 instead of its priority icon.
+    pinned = _item(priority="normal", pinned=True, context_summary="s", text="body")
+    card = notify.render_card([pinned], [], now=NOW, mode="plain", templates_cfg=_tcfg())
+    assert "📌" in card
+    assert "🟢" not in card  # the 'normal' priority icon is overridden
+
+
+def test_pinned_variant_routes_to_detailed():
+    # The shipped pinned → detailed variant: a pinned (even normal-priority) item
+    # gets the detailed profile's bigger Telegram expand.
+    pinned = _item(priority="normal", pinned=True, context_summary="sum", text="Z" * 500)
+    card = notify.render_card([pinned], [], now=NOW, mode="tg_html", templates_cfg=_tcfg())
+    assert card.count("Z") > 280  # detailed cap applied via the pinned variant
+
+
+def test_pinned_variant_matches_boolean():
+    assert templates._variant_matches(_item(pinned=True), {"pinned": [True]})
+    assert not templates._variant_matches(_item(pinned=False), {"pinned": [True]})
+    assert not templates._variant_matches(_item(), {"pinned": [True]})  # absent → no match
+
+
 def test_variant_only_affects_blocks_not_header():
     # active_profile=compact, but a high item is routed to detailed by the variant.
     # The HEADER stays compact (single line); only that item's block is detailed.
