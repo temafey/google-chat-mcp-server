@@ -153,7 +153,7 @@ def test_header_zero_overdue():
 def test_plain_new_block_layout():
     card = notify.render_card([_item()], [], now=NOW, mode="plain")
     assert "🔴 Mariia Ivanova" in card  # high → 🔴, no bold markup
-    assert "📍 Mobile internal · 🕒 2h ago" in card  # labelled meta line
+    assert "📍 Mobile internal · 🕒 04 Jun 10:00" in card  # absolute send time, never stale
     assert "💬 API audit: enumerate group-chat system messages" in card  # summary line
     # The original message appears under a labelled cut (distinct from the summary).
     assert "   Original message" in card

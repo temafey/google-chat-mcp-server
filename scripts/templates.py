@@ -35,7 +35,9 @@ from string import Template
 # the existing deep-merge upgrade path. Edit a copy in config.json to customise.
 #
 # Placeholders available to the NEW block template (values pre-escaped per channel):
-#   $icon $sender $location $reltime $summary $message  — atomic
+#   $icon $sender $location $abstime $reltime $summary $message  — atomic
+#     $abstime — absolute local send time '04 Jun 10:00' (NEVER goes stale; default)
+#     $reltime — relative age '2m ago' at SEND time (kept for back-compat; goes stale)
 #   $original_message                                   — localized "Original message" label
 #   $message_block  — the original-message wrapper (expandable on Telegram), or ""
 #   $link_block     — the "Open in Chat" line, or ""    (both carry a leading newline)
@@ -118,7 +120,7 @@ DEFAULT_TEMPLATES: dict = {
             "divider": "──────────",
             "counts_sep": " · ",
             "header": "$title\n$counts\n$divider",
-            "new_block": "$icon $sender\n📍 $location · 🕒 $reltime\n💬 $summary$message_block$link_block",
+            "new_block": "$icon $sender\n📍 $location · 🕒 $abstime\n💬 $summary$message_block$link_block",
             "overdue_block": "⏰ $sender\n   $promise_label \"$promise\"\n   $due_label $due$link_block",
             # Show the original message under the cut (only when a distinct summary exists).
             "show_message": True,
@@ -130,7 +132,7 @@ DEFAULT_TEMPLATES: dict = {
             "divider": "──────────",
             "counts_sep": " · ",
             "header": "$title · $counts",
-            "new_block": "$icon $sender · $location · $reltime\n💬 $summary",
+            "new_block": "$icon $sender · $location · $abstime\n💬 $summary",
             "overdue_block": "⏰ $sender · $due_label $due · $promise",
             "show_message": False,
         },
@@ -142,7 +144,7 @@ DEFAULT_TEMPLATES: dict = {
             "divider": "──────────",
             "counts_sep": " · ",
             "header": "$title\n$counts\n$divider",
-            "new_block": "$icon $sender\n📍 $location · 🕒 $reltime\n💬 $summary$message_block$link_block",
+            "new_block": "$icon $sender\n📍 $location · 🕒 $abstime\n💬 $summary$message_block$link_block",
             "overdue_block": "⏰ $sender\n   $promise_label \"$promise\"\n   $due_label $due$link_block",
             "show_message": True,
         },
@@ -278,7 +280,7 @@ def render(
         blocks.append(Template(notify._pick_form(loc["more_new"], rest, rule)).safe_substitute(count=rest))
     for it in esc_items:
         prof = _profile(tcfg, _variant_profile_name(it, tcfg))
-        blocks.append(_render_overdue_block(it, prof, loc, mode=mode, link_fn=link_fn, notify=notify))
+        blocks.append(_render_overdue_block(it, prof, loc, now=now, mode=mode, link_fn=link_fn, notify=notify))
 
     if not blocks:
         return header
@@ -315,7 +317,9 @@ def _render_new_block(item, prof, loc, *, now, mode, link_fn, notify) -> str:
     else:
         location = item.get("space_display") or item.get("space_name") or "Chat"
     location = esc(location, mode)
-    reltime = notify.relative_time(item.get("created_time"), now, loc)
+    created = item.get("created_time")
+    reltime = notify.relative_time(created, now, loc)
+    abstime = notify.absolute_time(created, now, loc)
 
     tg_cap = prof.get("tg_summary_cap", 280)
 
@@ -330,6 +334,7 @@ def _render_new_block(item, prof, loc, *, now, mode, link_fn, notify) -> str:
         "sender": sender,
         "location": location,
         "reltime": reltime,
+        "abstime": abstime,
         "summary": esc(notify._snippet(summary_src), mode),
         "message": esc(notify._snippet(item.get("text"), tg_cap or 140), mode),
         "message_block": message_block,
@@ -339,11 +344,11 @@ def _render_new_block(item, prof, loc, *, now, mode, link_fn, notify) -> str:
     return Template(prof["new_block"]).safe_substitute(mapping)
 
 
-def _render_overdue_block(item, prof, loc, *, mode, link_fn, notify) -> str:
+def _render_overdue_block(item, prof, loc, *, now, mode, link_fn, notify) -> str:
     esc = notify._esc
     sender = notify._bold(esc(item.get("sender_name") or loc["unknown_sender"], mode), mode)
     promise = esc(item.get("my_promise") or "(unspecified)", mode)
-    due_raw = notify.human_due(item.get("promise_due"), loc)
+    due_raw = notify.human_due(item.get("promise_due"), loc, now=now)
     mapping = {
         "icon": "⏰",
         "sender": sender,

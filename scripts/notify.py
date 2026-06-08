@@ -145,12 +145,36 @@ def relative_time(iso_str, now: datetime | None, loc: dict | None = None) -> str
     return fmt("rel_day", days, "${count}d ago")
 
 
-def human_due(iso_str, loc: dict | None = None) -> str:
-    """Human due date, e.g. '04 Jun 18:00' (UTC, deterministic).
+def absolute_time(iso_str, now: datetime | None, loc: dict | None = None) -> str:
+    """Absolute send time of the message, e.g. '04 Jun 10:00'.
 
-    Month abbreviations come from ``loc['months']`` (12-entry list) when supplied, else
-    English. The localized ``loc['no_due']`` (default '(no due date)') is returned when
-    the date is absent; an unparseable value falls back to its raw string.
+    Unlike :func:`relative_time` this never goes stale once the (static) digest
+    lands in Telegram / Google Chat — it shows WHEN the message was actually sent,
+    not its age at send-time. The timestamp is rendered in ``now``'s timezone
+    (production: the config tz injected via :func:`_resolve_now`), falling back to
+    UTC when ``now`` is naive / None. Month abbreviations come from ``loc['months']``
+    (12-entry list) when supplied, else English. Empty string on a junk/absent date.
+    """
+    dt = _parse_iso(iso_str)
+    if dt is None:
+        return ""
+    loc = loc or {}
+    tz = now.tzinfo if (now is not None and now.tzinfo is not None) else timezone.utc
+    local = dt.astimezone(tz)
+    months = loc.get("months") or _MONTHS_EN
+    mon = months[local.month - 1] if len(months) == 12 else _MONTHS_EN[local.month - 1]
+    return f"{local.day:02d} {mon} {local.hour:02d}:{local.minute:02d}"
+
+
+def human_due(iso_str, loc: dict | None = None, now: datetime | None = None) -> str:
+    """Human due date, e.g. '04 Jun 18:00'.
+
+    Rendered in ``now``'s timezone (production: the config tz via :func:`_resolve_now`)
+    so it matches the wall clock the user reads it on; falls back to UTC when ``now``
+    is naive / None. Month abbreviations come from ``loc['months']`` (12-entry list)
+    when supplied, else English. The localized ``loc['no_due']`` (default
+    '(no due date)') is returned when the date is absent; an unparseable value falls
+    back to its raw string.
     """
     loc = loc or {}
     if not iso_str:
@@ -158,6 +182,8 @@ def human_due(iso_str, loc: dict | None = None) -> str:
     dt = _parse_iso(iso_str)
     if dt is None:
         return str(iso_str)
+    tz = now.tzinfo if (now is not None and now.tzinfo is not None) else timezone.utc
+    dt = dt.astimezone(tz)
     months = loc.get("months") or _MONTHS_EN
     mon = months[dt.month - 1] if len(months) == 12 else _MONTHS_EN[dt.month - 1]
     return f"{dt.day:02d} {mon} {dt.hour:02d}:{dt.minute:02d}"

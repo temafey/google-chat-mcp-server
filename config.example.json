@@ -182,7 +182,7 @@
         "divider": "──────────",
         "counts_sep": " · ",
         "header": "$title\n$counts\n$divider",
-        "new_block": "$icon $sender\n📍 $location · 🕒 $reltime\n💬 $summary$message_block$link_block",
+        "new_block": "$icon $sender\n📍 $location · 🕒 $abstime\n💬 $summary$message_block$link_block",
         "overdue_block": "⏰ $sender\n   $promise_label \"$promise\"\n   $due_label $due$link_block",
         "show_message": true
       },
@@ -192,7 +192,7 @@
         "divider": "──────────",
         "counts_sep": " · ",
         "header": "$title · $counts",
-        "new_block": "$icon $sender · $location · $reltime\n💬 $summary",
+        "new_block": "$icon $sender · $location · $abstime\n💬 $summary",
         "overdue_block": "⏰ $sender · $due_label $due · $promise",
         "show_message": false
       },
@@ -202,7 +202,7 @@
         "divider": "──────────",
         "counts_sep": " · ",
         "header": "$title\n$counts\n$divider",
-        "new_block": "$icon $sender\n📍 $location · 🕒 $reltime\n💬 $summary$message_block$link_block",
+        "new_block": "$icon $sender\n📍 $location · 🕒 $abstime\n💬 $summary$message_block$link_block",
         "overdue_block": "⏰ $sender\n   $promise_label \"$promise\"\n   $due_label $due$link_block",
         "show_message": true
       }

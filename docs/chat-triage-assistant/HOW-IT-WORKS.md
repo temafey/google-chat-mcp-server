@@ -143,9 +143,15 @@ PYTHONPATH=. uv run pytest -q          # 247 passed
 
 - The digest layout is **config-driven**, not hard-coded. Rendering lives in
   `scripts/templates.py`: named **profiles** (`default`, `compact`, `detailed`),
-  **locales** (`en`, `ru`, `uk`) for labels/relative-time/plurals, and per-item
+  **locales** (`en`, `ru`, `uk`) for labels/dates/plurals, and per-item
   **variants** that override the profile by an item's `priority` / `space_name` /
   `space_type` / `trigger`.
+- **Time shown is the message's absolute send time** (`$abstime`, e.g. `08 Jun 14:32`),
+  rendered in the config tz (`quiet_hours.tz`, default `Europe/Kyiv`) so it matches the
+  wall clock you read it on. The static digest text never re-renders, so a relative age
+  ("2m ago") would go stale the moment you open it — absolute time does not. The old
+  relative placeholder `$reltime` is still available for custom templates, and `human_due`
+  (overdue blocks) renders in the same tz.
 - `notify.render_card` / `notify.build_digest` are thin delegates to
   `templates.render`. Senders hold `self._templates` from `config["templates"]`;
   `config.py` deep-merges `DEFAULT_TEMPLATES` on load (a partial config is upgraded,
