@@ -63,6 +63,9 @@ def test_upsert_new_item(store_path):
     assert item["id"] == iid
     assert item["status"] == "new"
     assert item["detected_at"] == "2026-06-04T13:00:00Z"
+    # A fresh item defaults to UN-pinned (the pin flag is orthogonal to status).
+    assert item["pinned"] is False
+    assert item["pinned_at"] is None
     events = [h["event"] for h in item["history"]]
     assert events == ["detected"]
 

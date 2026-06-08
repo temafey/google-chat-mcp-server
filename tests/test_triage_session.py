@@ -242,6 +242,38 @@ def test_record_response_sets_answered_and_persists(store_path):
     assert reloaded["answered_at"] == "2026-06-04T13:00:00Z"
 
 
+def test_pin_sets_flag_without_status_or_history_churn(store_path):
+    s, iid = _fresh(store_path)
+    before_status = s["items"][iid]["status"]
+    before_history = len(s["items"][iid]["history"])
+
+    item = triage_session.pin(s, iid, now=FIXED, path=store_path)
+
+    assert item["pinned"] is True
+    assert item["pinned_at"] == "2026-06-04T13:00:00Z"  # _iso(FIXED)
+    # Pin is ORTHOGONAL to the status machine: no status change, no history entry.
+    assert item["status"] == before_status
+    assert len(item["history"]) == before_history
+
+    reloaded = store.load(store_path)["items"][iid]
+    assert reloaded["pinned"] is True
+    assert reloaded["pinned_at"] == "2026-06-04T13:00:00Z"
+    assert len(reloaded["history"]) == before_history
+
+
+def test_unpin_clears_flag(store_path):
+    s, iid = _fresh(store_path)
+    triage_session.pin(s, iid, now=FIXED, path=store_path)
+
+    item = triage_session.unpin(s, iid, now=FIXED, path=store_path)
+
+    assert item["pinned"] is False
+    assert item["pinned_at"] is None
+    reloaded = store.load(store_path)["items"][iid]
+    assert reloaded["pinned"] is False
+    assert reloaded["pinned_at"] is None
+
+
 def test_close_item_sets_closed_and_persists(store_path):
     s, iid = _fresh(store_path)
     item = triage_session.close_item(s, iid, now=FIXED, path=store_path)
@@ -276,6 +308,10 @@ def test_unknown_id_propagates_keyerror_on_every_mutator(store_path):
         triage_session.record_response(
             s, bad, response_text="x", response_posted="spaces/AAA/messages/Z",
             now=FIXED, path=store_path)
+    with pytest.raises(KeyError):
+        triage_session.pin(s, bad, now=FIXED, path=store_path)
+    with pytest.raises(KeyError):
+        triage_session.unpin(s, bad, now=FIXED, path=store_path)
     with pytest.raises(KeyError):
         triage_session.close_item(s, bad, now=FIXED, path=store_path)
     with pytest.raises(KeyError):

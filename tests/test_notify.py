@@ -70,8 +70,8 @@ class FakeSender:
     def enabled(self, cfg):
         return True
 
-    def send(self, summary, items):
-        self.calls.append((summary, list(items)))
+    def send(self, new_items, esc_items, now):
+        self.calls.append((list(new_items), list(esc_items), now))
         if self._raises:
             raise RuntimeError("boom")
         return self._ok
@@ -128,6 +128,102 @@ def test_already_notified_not_renotified(tmp_path):
     assert res["new_notified"] == []
     # unchanged
     assert st["items"]["seen"]["last_notified"] == "2026-06-01T10:00:00Z"
+
+
+# --------------------------------------------------------------------------- #
+# Pin piggyback.
+# --------------------------------------------------------------------------- #
+def test_pinned_item_rides_along_but_not_marked_notified(tmp_path):
+    # A DM fires the digest (baseline); a plain pinned broadcast is NOT a baseline
+    # candidate on its own, but rides along because the digest is already firing.
+    trigger_item = _item("dm", trigger="direct_dm")
+    pinned = _item("pin", trigger="broadcast", text="plain note", pinned=True)
+    st = _store(trigger_item, pinned)
+    sender = FakeSender()
+
+    res = notify.run_once(
+        st, _cfg(), now=ACTIVE_NOW, senders=[sender], store_path=tmp_path / "s.json",
+    )
+
+    dispatched_ids = {it["id"] for it in sender.calls[0][0]}
+    assert dispatched_ids == {"dm", "pin"}            # pin rode along
+    assert res["pinned_ridealong"] == ["pin"]
+    # The pin is NEVER marked notified — it reappears every cycle until unpinned.
+    assert "pin" not in res["new_notified"]
+    assert st["items"]["pin"]["last_notified"] is None
+    assert st["items"]["dm"]["last_notified"] is not None
+
+
+def test_pinned_item_alone_never_forces_send(tmp_path):
+    # Nothing else is firing — a lone pin must NOT trigger a digest.
+    pinned = _item("pin", trigger="broadcast", text="plain note", pinned=True)
+    st = _store(pinned)
+    sender = FakeSender()
+
+    res = notify.run_once(
+        st, _cfg(), now=ACTIVE_NOW, senders=[sender], store_path=tmp_path / "s.json",
+    )
+
+    assert sender.calls == []                          # nothing dispatched
+    assert res["pinned_ridealong"] == []
+    assert st["items"]["pin"]["last_notified"] is None
+
+
+def test_pinned_candidate_not_duplicated(tmp_path):
+    # An item that is BOTH a baseline NEW candidate AND pinned appears once, and is
+    # marked notified normally (it is not a ride-along).
+    pinned_dm = _item("dm", trigger="direct_dm", pinned=True)
+    st = _store(pinned_dm)
+    sender = FakeSender()
+
+    res = notify.run_once(
+        st, _cfg(), now=ACTIVE_NOW, senders=[sender], store_path=tmp_path / "s.json",
+    )
+
+    dispatched_ids = [it["id"] for it in sender.calls[0][0]]
+    assert dispatched_ids.count("dm") == 1             # not duplicated
+    assert res["pinned_ridealong"] == []               # already a NEW candidate
+    assert "dm" in res["new_notified"]
+    assert st["items"]["dm"]["last_notified"] is not None
+
+
+def test_pinned_closed_item_is_inert(tmp_path):
+    # A pin on a terminal (closed) item never rides along — pins follow open items.
+    trigger_item = _item("dm", trigger="direct_dm")
+    pinned_closed = _item("pinc", trigger="broadcast", text="x", pinned=True, status="closed")
+    st = _store(trigger_item, pinned_closed)
+    sender = FakeSender()
+
+    res = notify.run_once(
+        st, _cfg(), now=ACTIVE_NOW, senders=[sender], store_path=tmp_path / "s.json",
+    )
+
+    dispatched_ids = {it["id"] for it in sender.calls[0][0]}
+    assert "pinc" not in dispatched_ids
+    assert res["pinned_ridealong"] == []
+
+
+def test_pinned_item_suppressed_in_quiet_hours(tmp_path):
+    # During quiet hours only the escalation safety net speaks; pins behave like
+    # NEW items and are suppressed (they do NOT ride along on an escalation).
+    now_quiet = datetime(2026, 6, 4, 23, 0, tzinfo=KIEV)  # inside default 22:00–08:00
+    overdue = _item(
+        "ovd", status="awaiting_me", my_promise="send report",
+        promise_due="2026-06-04T10:00:00Z",  # < now → overdue
+    )
+    pinned = _item("pin", trigger="broadcast", text="plain note", pinned=True)
+    st = _store(overdue, pinned)
+    sender = FakeSender()
+
+    res = notify.run_once(
+        st, _cfg(), now=now_quiet, senders=[sender], store_path=tmp_path / "s.json",
+    )
+
+    assert "ovd" in res["escalated"]                   # safety net still fires
+    dispatched_ids = {it["id"] for it in sender.calls[0][0]}
+    assert "pin" not in dispatched_ids                 # pin suppressed in quiet hours
+    assert res["pinned_ridealong"] == []
+    assert st["items"]["pin"]["last_notified"] is None
 
 
 # --------------------------------------------------------------------------- #
@@ -279,8 +375,13 @@ def test_gcinbox_send_success(monkeypatch):
     sender = notify.GCInboxSender(
         {"channels": {"gc_inbox": {"enabled": True, "space_name": "spaces/INBOX"}}}
     )
-    assert sender.send("digest", []) is True
-    assert calls["args"] == ("spaces/INBOX", "digest")
+    item = _item("dm", trigger="direct_dm", sender_name="Mariia")
+    assert sender.send([item], [], ACTIVE_NOW) is True
+    space_name, text = calls["args"]
+    assert space_name == "spaces/INBOX"
+    # GC Inbox renders the 'gchat' dialect — header + *bold* sender.
+    assert text.startswith("📥 Chat triage")
+    assert "*Mariia*" in text
 
 
 def test_gcinbox_send_failure_returns_false(monkeypatch):
@@ -291,7 +392,7 @@ def test_gcinbox_send_failure_returns_false(monkeypatch):
     sender = notify.GCInboxSender(
         {"channels": {"gc_inbox": {"enabled": True, "space_name": "spaces/INBOX"}}}
     )
-    assert sender.send("digest", []) is False
+    assert sender.send([_item("dm", trigger="direct_dm")], [], ACTIVE_NOW) is False
 
 
 def test_gcinbox_send_awaits_coroutine(monkeypatch):
@@ -302,7 +403,7 @@ def test_gcinbox_send_awaits_coroutine(monkeypatch):
     sender = notify.GCInboxSender(
         {"channels": {"gc_inbox": {"enabled": True, "space_name": "spaces/INBOX"}}}
     )
-    assert sender.send("digest", []) is True
+    assert sender.send([_item("dm", trigger="direct_dm")], [], ACTIVE_NOW) is True
 
 
 # --------------------------------------------------------------------------- #
@@ -325,39 +426,60 @@ def test_dry_run_sends_and_persists_nothing(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Digest NEW-section display cap (header keeps TRUE totals; cap is text-only).
+# Card digest — header / NEW-section cap (header keeps TRUE totals).
 # --------------------------------------------------------------------------- #
-def test_digest_caps_new_lines_with_overflow():
+def _new_block_starts(lines):
+    """Card NEW blocks open with a priority icon; OVERDUE blocks open with ⏰."""
+    icons = ("🔴", "🟡", "🟢", "⚪")
+    return [ln for ln in lines if ln.startswith(icons)]
+
+
+def test_digest_header_two_lines_and_divider():
+    new_items = [_item("n0", trigger="direct_dm")]
+    esc_items = [_item("o0", my_promise="reply", promise_due="2026-06-04T08:00:00Z")]
+    lines = notify.build_digest(new_items, esc_items, now=ACTIVE_NOW).splitlines()
+    assert lines[0] == "📥 Chat triage"
+    assert lines[1] == "🆕 1 new · ⏰ 1 overdue"
+    assert lines[2] == "──────────"
+
+
+def test_digest_header_drops_new_clause_when_zero():
+    esc_items = [_item("o0", my_promise="reply", promise_due="2026-06-04T08:00:00Z")]
+    lines = notify.build_digest([], esc_items, now=ACTIVE_NOW).splitlines()
+    assert lines[0] == "📥 Chat triage"
+    assert lines[1] == "⏰ 1 overdue"  # no 🆕 clause
+    assert "new" not in lines[1]
+
+
+def test_digest_header_drops_overdue_clause_when_zero():
+    new_items = [_item("n0", trigger="direct_dm")]
+    lines = notify.build_digest(new_items, [], now=ACTIVE_NOW).splitlines()
+    assert lines[1] == "🆕 1 new"  # no ⏰ clause
+    assert "overdue" not in lines[1]
+
+
+def test_digest_caps_new_blocks_with_overflow():
     new_items = [_item(f"n{i}", trigger="direct_dm", sender_name=f"S{i}") for i in range(25)]
-    digest = notify.build_digest(new_items, [], cap=10)
+    digest = notify.build_digest(new_items, [], now=ACTIVE_NOW, cap=10)
     lines = digest.splitlines()
 
-    # header + 10 NEW lines + exactly one overflow line == 12 lines total.
-    assert len(lines) == 12
-    assert lines[0] == "📥 Chat triage — 25 new, 0 overdue"  # TRUE total
-    new_lines = [ln for ln in lines if ln.startswith("• NEW")]
-    assert len(new_lines) == 10
+    assert lines[1] == "🆕 25 new"  # TRUE total in header
+    assert len(_new_block_starts(lines)) == 10
     overflow = [ln for ln in lines if "more new" in ln]
-    assert overflow == ["• …and 15 more new"]
+    assert overflow == ["…and 15 more new"]
 
 
 def test_digest_exact_cap_no_overflow():
     new_items = [_item(f"n{i}", trigger="direct_dm") for i in range(10)]
-    digest = notify.build_digest(new_items, [], cap=10)
-    lines = digest.splitlines()
-
-    new_lines = [ln for ln in lines if ln.startswith("• NEW")]
-    assert len(new_lines) == 10
+    lines = notify.build_digest(new_items, [], now=ACTIVE_NOW, cap=10).splitlines()
+    assert len(_new_block_starts(lines)) == 10
     assert not any("more new" in ln for ln in lines)
 
 
 def test_digest_under_cap_shows_all():
     new_items = [_item(f"n{i}", trigger="direct_dm") for i in range(3)]
-    digest = notify.build_digest(new_items, [], cap=10)
-    lines = digest.splitlines()
-
-    new_lines = [ln for ln in lines if ln.startswith("• NEW")]
-    assert len(new_lines) == 3
+    lines = notify.build_digest(new_items, [], now=ACTIVE_NOW, cap=10).splitlines()
+    assert len(_new_block_starts(lines)) == 3
     assert not any("more new" in ln for ln in lines)
 
 
@@ -367,17 +489,18 @@ def test_digest_overdue_never_truncated_even_when_new_overflows():
         _item(f"o{i}", sender_name=f"O{i}", my_promise="reply", promise_due="2026-06-04T08:00:00Z")
         for i in range(12)
     ]
-    digest = notify.build_digest(new_items, esc_items, cap=10)
+    digest = notify.build_digest(new_items, esc_items, now=ACTIVE_NOW, cap=10)
     lines = digest.splitlines()
 
-    overdue_lines = [ln for ln in lines if "OVERDUE" in ln]
+    overdue_lines = [ln for ln in lines if ln.startswith("⏰")]
     assert len(overdue_lines) == 12  # all overdue present, never capped
-    new_lines = [ln for ln in lines if ln.startswith("• NEW")]
-    assert len(new_lines) == 10  # NEW still capped
+    # NEW blocks still capped at 10 (overflow line excluded by the ⏰ filter).
+    new_blocks = [ln for ln in _new_block_starts(lines) if not ln.startswith("⏰")]
+    assert len(new_blocks) == 10
 
 
 def test_run_once_marks_all_candidates_notified_regardless_of_display_cap(tmp_path):
-    # 25 NEW candidates — more than DIGEST_NEW_CAP. The digest TEXT caps at 10,
+    # 25 NEW candidates — more than DIGEST_NEW_CAP. The rendered TEXT caps at 10,
     # but ALL 25 dispatched items must still be marked notified.
     candidates = [_item(f"n{i}", trigger="direct_dm") for i in range(25)]
     st = _store(*candidates)
@@ -390,7 +513,10 @@ def test_run_once_marks_all_candidates_notified_regardless_of_display_cap(tmp_pa
 
     assert len(res["new_notified"]) == 25  # all candidates, NOT <= cap
     assert all(st["items"][f"n{i}"]["last_notified"] is not None for i in range(25))
-    # The dispatched digest text itself was capped (header still says 25 new).
-    summary = sender.calls[0][0]
-    assert summary.splitlines()[0] == "📥 Chat triage — 25 new, 0 overdue"
-    assert "• …and 15 more new" in summary
+    # The sender received ALL 25 items (it renders its own text); the rendered
+    # plain Card still caps the visible blocks at 10 with an overflow line.
+    dispatched_new, dispatched_esc, _now = sender.calls[0]
+    assert len(dispatched_new) == 25
+    rendered = notify.build_digest(dispatched_new, dispatched_esc, now=ACTIVE_NOW)
+    assert rendered.splitlines()[1] == "🆕 25 new"
+    assert "…and 15 more new" in rendered

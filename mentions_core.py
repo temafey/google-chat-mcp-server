@@ -35,12 +35,22 @@ import google_chat as gchat
 # (every DM message is for me, no mention required).
 _MENTIONABLE_SPACE_TYPES = ("SPACE", "GROUP_CHAT")
 
-# Heuristics for a room-wide ("@all" / "@here") mention. The exact annotation
-# shape Google Chat emits for a broadcast under user OAuth is NOT confirmed
-# against a live message — see module README / task output. We accept a few
-# plausible signals so detection degrades gracefully:
-#   * userMention.user.type is a broadcast sentinel, or
-#   * userMention.user.name is a broadcast sentinel id.
+# A USER_MENTION annotation's ``userMention.type`` (UserMentionMetadata.Type)
+# distinguishes a real @mention from a membership add. The public REST enum is
+# {TYPE_UNSPECIFIED, ADD, MENTION}: ``ADD`` means "this user was ADDED to the
+# space" (a membership event), NOT "@-mentioned". We must not treat being added
+# to a space as a mention of me — only ``MENTION`` (or an unspecified/absent
+# type, treated permissively) counts. Verified against the Chat API reference
+# (google.chat.v1 Annotation / UserMentionMetadata), 2026-06-07.
+_NON_MENTION_USERMENTION_TYPES = {"ADD"}
+
+# Best-effort heuristics for a room-wide ("@all" / "@here") mention. IMPORTANT:
+# the public Chat REST API does NOT document any @all/@everyone representation —
+# a USER_MENTION's ``user`` is always a concrete ``users/{id}`` (human or BOT),
+# and there is no ``users/all`` sentinel in the reference. These sentinels are
+# therefore defensive only (harmless if Google never emits them); a real
+# broadcast may simply arrive as plain "@all" text with no annotation and go
+# undetected. Do NOT rely on broadcast detection being complete.
 _BROADCAST_USER_TYPES = {"ALL", "HERE", "EVERYONE"}
 _BROADCAST_SENTINEL_NAMES = {"users/all", "users/here", "users/everyone"}
 
@@ -87,12 +97,29 @@ def _is_dormant(space: Dict[str, Any], since_dt: Optional[datetime.datetime]) ->
     return last < since_dt
 
 
+def _is_real_mention(um: Dict[str, Any]) -> bool:
+    """True unless this ``userMention`` is an ADD (membership), not an @mention.
+
+    ``ADD`` annotations are emitted when a user is added to a space; they are not
+    a mention of anyone. An absent / unspecified type is treated permissively as
+    a mention (forward-compatible with future enum values).
+    """
+    return str(um.get("type") or "").upper() not in _NON_MENTION_USERMENTION_TYPES
+
+
 def _iter_user_mentions(message: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
-    """Yield the ``userMention`` payload of every USER_MENTION annotation."""
+    """Yield the ``userMention`` payload of every *real* USER_MENTION annotation.
+
+    Membership-add annotations (``userMention.type == "ADD"``) are skipped — see
+    :func:`_is_real_mention`.
+    """
     for ann in message.get("annotations") or []:
         if ann.get("type") != "USER_MENTION":
             continue
-        yield ann.get("userMention") or {}
+        um = ann.get("userMention") or {}
+        if not _is_real_mention(um):
+            continue
+        yield um
 
 
 def _mention_trigger(message: Dict[str, Any], me: str) -> Optional[str]:
@@ -100,6 +127,7 @@ def _mention_trigger(message: Dict[str, Any], me: str) -> Optional[str]:
 
     Returns ``"user_mention"`` if I'm mentioned by id (wins outright),
     ``"broadcast"`` if only a room-wide mention is present, else ``None``.
+    Membership-add annotations are ignored (see :func:`_iter_user_mentions`).
     """
     broadcast = False
     for um in _iter_user_mentions(message):

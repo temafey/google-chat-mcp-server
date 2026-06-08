@@ -22,7 +22,7 @@ A task is DONE only when `verified` (independent verifier PASS + gate demo where
 | T2.2 GC Inbox channel | C | verified | Live space `spaces/AAQAH7kLhwc` "My Triage / Inbox" |
 | T2.3 WSL cron wiring | C | verified | `*/5` flock-guarded `triage_cron.sh`; survives WSL restart via `/etc/wsl.conf`; installer `install_cron.sh` |
 | T3.1 triage_brief | D | verified | Open-items digest from store.json (triage_session.triage_queue) |
-| T3.2 triage protocol | D | built | triage_session.py (pure state) + triage_cli.py (`post` = sole net writer); skill `.claude/skills/chat-triage/SKILL.md`. NOT yet exercised on real data -> follow-up #2 |
+| T3.2 triage protocol | D | verified | triage_session.py (pure state) + triage_cli.py (`post` = sole net writer); skill `.claude/skills/chat-triage/SKILL.md`. Exercised end-to-end via Phases A/B/C (2026-06-07) -> follow-up #2 DONE |
 | T3.3 /chat-triage command | D | verified | Skill invoked from a session opened in the repo |
 | T4.1 Telegram sender | E | verified | Live bot `@expo_artem_chat_triage_bot`; token-leak-safe; `TELEGRAM_CHAT_ID=67273769` |
 | T4.2 Windows toast sender | E | todo | NOT built; channel `enabled=false` |
@@ -43,12 +43,15 @@ A task is DONE only when `verified` (independent verifier PASS + gate demo where
 
 ## Pending follow-ups (see DEBUG-GUIDE.md)
 
-1. **Polish cron-fired notifications.** Root cause confirmed: all 82 store items have
-   `sender_name` = raw `users/<id>` (display name never resolved) -> digests unreadable.
-   Fix in collector seeding + `google_chat.get_user_display_name()` / `list_space_members` cache.
-2. **Really test triage logic end-to-end.** All 82 items are `status=new`; the lifecycle
-   (triaged / answered / snoozed / promise / closed) has never run on real data. Run
-   `/chat-triage` through the confirmation gate on a real item.
+1. **Polish cron-fired notifications.** ✅ DONE (2026-06-05) — sender-name resolution
+   merged: collector warms a Google People domain-directory cache
+   (`gchat.warm_directory_cache`, scope `directory.readonly`) + per-id `people.get`
+   fallback in `collect_mentions.py`. Live store names resolve.
+2. **Really test triage logic end-to-end.** ✅ DONE (2026-06-07) — lifecycle exercised
+   via the test campaign: Phase A (full state machine on a store copy), Phase B (one
+   live post to the user's own Inbox `spaces/AAQAH7kLhwc` -> answered, verified in Chat;
+   confirmation gate holds on decline), Phase C (snooze/promise/close/ignore + overdue
+   escalation). Live store items never mutated. See `TRIAGE-LIFECYCLE.md`.
 
 ## Known issues
 
@@ -58,15 +61,16 @@ A task is DONE only when `verified` (independent verifier PASS + gate demo where
   `git cat-file -e HEAD:scripts/triage_session.py`.
 - `token.json.lock` was not gitignored -> added to `.gitignore`.
 
-## Ground truth (verified 2026-06-05, re-confirm if touching)
+## Ground truth (verified 2026-06-07, re-confirm if touching)
 
 - Runtime: `~/.claude-orchestrator/gchat-triage/` — config.json (enabled, cadence 5 min),
-  secrets.env (chmod 600), store.json (82 items, all `status=new`), logs/.
-- Code: `mentions_core.py` (root), `scripts/{collect_mentions,notify,store,config,triage_session,triage_cli}.py`,
+  secrets.env (chmod 600), store.json (sender names resolved via directory warm-up), logs/.
+- Code: `mentions_core.py` (root), `scripts/{collect_mentions,notify,store,config,triage_session,triage_cli,templates}.py`,
   `scripts/{triage_cron,install_cron}.sh`. Skill: `.claude/skills/chat-triage/SKILL.md`.
 - Channels: gc_inbox `spaces/AAQAH7kLhwc`; telegram bot live; windows_toast off.
-- Full suite: **157 passed** (`PYTHONPATH=. uv run pytest -q`).
-- Repo on `main`; *.env + token.json gitignored; token has read+write Chat + refresh_token.
+- Digest rendering is config-driven (`scripts/templates.py`: profiles default/compact/detailed; locales en/ru/uk; per-item variants).
+- Full suite: **247 passed** (`PYTHONPATH=. uv run pytest -q`).
+- Repo on branch `feat/triage-card-digest` (card-digest work); *.env + token.json gitignored; token has read+write Chat + refresh_token.
 
 ## Canonical config.json schema
 
@@ -96,3 +100,13 @@ A task is DONE only when `verified` (independent verifier PASS + gate demo where
 - 2026-06-04 — G1 PASSED on live account; T1.5 self-sent filter added; store rebuilt 124->71.
 - 2026-06-05 — Phases 1-3 + cron complete; G2 PASSED, G3 PARTIAL; channels live (GC Inbox + Telegram);
   157 tests pass. Journal reconciled with verified runtime state. 2 follow-ups open (see DEBUG-GUIDE.md).
+- 2026-06-05 — Sender-name resolution merged (Google People domain directory, scope
+  `directory.readonly`); live store names resolved (follow-up #1 DONE).
+- 2026-06-06 — Card-digest + config-driven template engine on branch `feat/triage-card-digest`
+  (`scripts/templates.py`; profiles + locales en/ru/uk + per-item variants; defang/escape
+  hardening); tests grew to 247.
+- 2026-06-07 — Lifecycle test campaign PASSED (orchestrator-verified): Phase A (full state
+  machine on a store copy), Phase B (one live post to the user's OWN Inbox `spaces/AAQAH7kLhwc`
+  -> answered, verified visible in Chat; `/chat-triage` confirmation gate holds on decline),
+  Phase C (snooze/promise/close/ignore + overdue-promise escalation, verified on a copy). Live
+  store items never mutated across A/B/C (follow-up #2 DONE).

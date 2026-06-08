@@ -25,6 +25,11 @@ try:  # ``import json`` kept local-friendly; stdlib only.
 except ImportError:  # pragma: no cover - json is always present in stdlib.
     raise
 
+# ``templates`` is a sibling module under scripts/; it imports stdlib only at module
+# level (its ``render`` does a function-local ``import notify``), so importing it here is
+# cycle-free. We embed its DEFAULT_TEMPLATES into the canonical config schema below.
+from templates import DEFAULT_TEMPLATES  # noqa: E402
+
 # --------------------------------------------------------------------------- #
 # Paths (runtime files live outside the repo, under ~/.claude-orchestrator).
 # --------------------------------------------------------------------------- #
@@ -57,6 +62,11 @@ DEFAULT_CONFIG: dict = {
     # priority in google_chat.get_user_display_name — wins over directory
     # lookups. Empty by default; the collector/backfill install these.
     "user_aliases": {},
+    # Digest rendering templates (profiles + locale labels + per-item variant rules).
+    # Owned by scripts/templates.py; switch ``active_profile`` / ``locale`` here, or edit
+    # ``profiles`` / ``locales`` / ``variants`` to customise. Deep-merged on load, so a
+    # custom value wins and new default keys are filled in on upgrade.
+    "templates": copy.deepcopy(DEFAULT_TEMPLATES),
 }
 
 # Commented placeholders only — NO real values ever land here.
