@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+import re
 import sys
 from abc import ABC, abstractmethod
 from datetime import datetime, time as dtime, timezone
@@ -547,6 +548,34 @@ def _bold(text: str, mode: str) -> str:
         return f"*{text}*"
     if mode == "tg_html":
         return f"<b>{text}</b>"
+    return text
+
+
+# Zero-width, no-break separator. Invisible and does NOT introduce a line-break
+# opportunity (unlike ZERO WIDTH SPACE U+200B), so it is safe to splice into prose.
+_WORD_JOINER = "⁠"
+# An intra-word dot: a word char, a literal dot, a word char (templates.py, foo.io,
+# v2.0, a@b.com). Sentence-ending dots ("…now. ") have a space after and never match.
+_INTRAWORD_DOT = re.compile(r"(?<=\w)\.(?=\w)")
+
+
+def _deautolink(text: str, mode: str) -> str:
+    """Break domain-like tokens so Telegram does NOT auto-linkify them.
+
+    Telegram's client linkifies anything that looks like a domain (``templates.py``
+    — ``.py`` is a real ccTLD — ``v2.0``, ``foo.io``), independent of our HTML and
+    NOT stopped by ``disable_web_page_preview``. We splice a zero-width WORD JOINER
+    right after each intra-word dot, so the domain pattern no longer matches while
+    the text stays visually identical (normal font, no monospace, no tap-to-copy —
+    the reasons ``<code>`` was rejected). ``tg_html`` only: ``gchat``/``plain`` have
+    no such auto-linking, so they are returned untouched. ``text`` is assumed
+    already html-escaped; html entities contain no intra-word dot, so they are
+    unaffected. Tradeoff: real urls inside the snippet also stop being tappable,
+    and copied text carries the invisible joiner — acted on per the user's choice;
+    the ``🔗 Open in Chat`` line is a separate real ``<a href>`` and is untouched.
+    """
+    if mode == "tg_html" and text:
+        return _INTRAWORD_DOT.sub("." + _WORD_JOINER, text)
     return text
 
 

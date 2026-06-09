@@ -32,8 +32,12 @@ def test_load_config_no_file_creates_default(tmp_path):
 
     assert cfg_path.exists(), "config.json should be created on first load"
     assert cfg == config.DEFAULT_CONFIG
-    # And the persisted bytes round-trip to the same dict.
-    assert json.loads(cfg_path.read_text()) == config.DEFAULT_CONFIG
+    # The code-owned templates section is NOT frozen into the file (it equals the
+    # defaults, so it is stripped); it is refilled from DEFAULT_CONFIG on load.
+    on_disk = json.loads(cfg_path.read_text())
+    assert "templates" not in on_disk
+    # Re-loading the (stripped) file round-trips to the full merged dict.
+    assert config.load_config(cfg_path) == config.DEFAULT_CONFIG
 
 
 def test_load_config_partial_file_is_upgraded_not_clobbered(tmp_path):
@@ -55,8 +59,46 @@ def test_load_config_partial_file_is_upgraded_not_clobbered(tmp_path):
         assert cfg[key] == value
     # The merged result is the full schema (same key set as DEFAULT_CONFIG).
     assert set(cfg) == set(config.DEFAULT_CONFIG)
-    # The upgraded file was persisted (re-load yields the same merged dict).
-    assert json.loads(cfg_path.read_text()) == cfg
+    # The upgraded file was persisted and re-loads to the same merged dict. The
+    # code-owned templates defaults are stripped on disk (refilled on load), so
+    # the round-trip — not byte-equality — is the invariant.
+    assert "templates" not in json.loads(cfg_path.read_text())
+    assert config.load_config(cfg_path) == cfg
+
+
+def test_template_default_change_reaches_runtime_not_frozen(tmp_path, monkeypatch):
+    """Regression: editing a code-owned template default must reach runtime.
+
+    The old behavior persisted the FULL templates block, freezing the defaults;
+    a later edit to templates.py was then shadowed by the frozen copy in the
+    file. Now defaults are stripped on persist, so a changed default flows
+    through on the next load.
+    """
+    cfg_path = tmp_path / "config.json"
+    # First load writes a stripped file — no frozen templates defaults.
+    config.load_config(cfg_path)
+    assert "templates" not in json.loads(cfg_path.read_text())
+
+    # Simulate a code-side default change to a profile's new_block.
+    new_default = copy.deepcopy(config.DEFAULT_CONFIG)
+    new_default["templates"]["profiles"]["default"]["new_block"] = "CHANGED $abstime"
+    monkeypatch.setattr(config, "DEFAULT_CONFIG", new_default)
+
+    cfg2 = config.load_config(cfg_path)
+    assert cfg2["templates"]["profiles"]["default"]["new_block"] == "CHANGED $abstime"
+
+
+def test_user_template_override_persists_minimally(tmp_path):
+    """A user override is kept; code-owned defaults are NOT frozen beside it."""
+    cfg_path = tmp_path / "config.json"
+    config.save_config({"templates": {"active_profile": "compact"}}, cfg_path)
+
+    cfg = config.load_config(cfg_path)
+    assert cfg["templates"]["active_profile"] == "compact"
+    # Full defaults are present at runtime (merged in)...
+    assert "default" in cfg["templates"]["profiles"]
+    # ...but ONLY the override is persisted under templates.
+    assert json.loads(cfg_path.read_text())["templates"] == {"active_profile": "compact"}
 
 
 def test_load_config_nested_partial_merges_recursively(tmp_path):

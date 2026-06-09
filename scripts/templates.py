@@ -335,8 +335,10 @@ def _render_new_block(item, prof, loc, *, now, mode, link_fn, notify) -> str:
         "location": location,
         "reltime": reltime,
         "abstime": abstime,
-        "summary": esc(notify._snippet(summary_src), mode),
-        "message": esc(notify._snippet(item.get("text"), tg_cap or 140), mode),
+        # Break domain-like tokens (e.g. "templates.py") in tg_html so Telegram
+        # does not auto-linkify them; visually unchanged. No-op elsewhere.
+        "summary": notify._deautolink(esc(notify._snippet(summary_src), mode), mode),
+        "message": notify._deautolink(esc(notify._snippet(item.get("text"), tg_cap or 140), mode), mode),
         "message_block": message_block,
         "link_block": _link_block(link_fn(item) if link_fn else None, loc, mode, notify=notify),
         "original_message": esc(loc["original_message"], mode),
@@ -371,7 +373,7 @@ def _message_block(text, loc, *, mode, tg_cap, notify) -> str:
     esc = notify._esc
     label = esc(loc["original_message"], mode)
     if mode == "tg_html":
-        body = esc(notify._snippet(text, tg_cap or 280), mode)
+        body = notify._deautolink(esc(notify._snippet(text, tg_cap or 280), mode), mode)
         if not body:
             return ""
         return f"\n<b>{label}</b>\n<blockquote expandable>{body}</blockquote>"

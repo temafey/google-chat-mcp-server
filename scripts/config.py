@@ -62,6 +62,13 @@ DEFAULT_CONFIG: dict = {
     # priority in google_chat.get_user_display_name — wins over directory
     # lookups. Empty by default; the collector/backfill install these.
     "user_aliases": {},
+    # Manual team/role/location (and optional email) overrides for the author
+    # roster: {"users/<id>": {"team": "Mobile", "role": "Backend Lead",
+    # "location": "Ukraine", "email": "..."}}. Surfaced by list_chat_authors and
+    # WINS over the domain directory, which is typically sparse on
+    # department/title (and has no location field). Any omitted sub-key falls
+    # back to the directory value. Empty by default.
+    "user_profiles": {},
     # Digest rendering templates (profiles + locale labels + per-item variant rules).
     # Owned by scripts/templates.py; switch ``active_profile`` / ``locale`` here, or edit
     # ``profiles`` / ``locales`` / ``variants`` to customise. Deep-merged on load, so a
@@ -76,6 +83,9 @@ _SECRETS_TEMPLATE = (
     "# Uncomment and fill in the values below to enable Telegram notifications.\n"
     "# TELEGRAM_BOT_TOKEN=\n"
     "# TELEGRAM_CHAT_ID=\n"
+    "# PeopleForce HRIS sync (scripts/peopleforce_sync.py). 'Company' API key:\n"
+    "# Settings -> API keys -> Generate. Fills team/role into config user_profiles.\n"
+    "# PEOPLEFORCE_API_KEY=\n"
 )
 
 
@@ -101,6 +111,55 @@ def _deep_merge(default: dict, override: dict) -> dict:
         else:
             merged[key] = copy.deepcopy(value)
     return merged
+
+
+# Sentinel: ``_diff_against_default`` returns this when a value is identical to
+# its default (the caller then drops the key entirely).
+_MISSING = object()
+
+
+def _diff_against_default(value, default):
+    """Return the minimal subtree of ``value`` that differs from ``default``.
+
+    Used to keep code-owned defaults OUT of the persisted ``config.json`` so that
+    future edits to those defaults always reach runtime instead of being shadowed
+    by a frozen copy in the file. Returns ``_MISSING`` when ``value`` equals
+    ``default`` (caller drops the key). For dicts, recurses key-by-key; keys
+    absent from ``default`` are kept verbatim (user / forward-compat additions).
+    Non-dicts and lists are compared whole — a customized list is kept entire.
+    """
+    if isinstance(value, dict) and isinstance(default, dict):
+        out: dict = {}
+        for key, val in value.items():
+            if key in default:
+                diff = _diff_against_default(val, default[key])
+                if diff is not _MISSING:
+                    out[key] = diff
+            else:
+                out[key] = copy.deepcopy(val)
+        return out if out else _MISSING
+    return _MISSING if value == default else copy.deepcopy(value)
+
+
+def _persistable(merged: dict) -> dict:
+    """``merged`` with the code-owned ``templates`` section reduced to its diff.
+
+    The ``templates`` block (profiles / locales / variants / active_profile /
+    locale) is owned by ``scripts/templates.py`` via ``DEFAULT_TEMPLATES``.
+    Persisting the full block freezes those defaults and shadows future edits —
+    the exact footgun this avoids. We persist ONLY the parts a user actually
+    customized; everything else is refilled from ``DEFAULT_CONFIG`` on load. All
+    non-template keys (user state: me_user_id, channels, user_profiles, …) are
+    kept verbatim.
+    """
+    to_save = copy.deepcopy(merged)
+    if "templates" in to_save and "templates" in DEFAULT_CONFIG:
+        diff = _diff_against_default(to_save["templates"], DEFAULT_CONFIG["templates"])
+        if diff is _MISSING:
+            to_save.pop("templates")
+        else:
+            to_save["templates"] = diff
+    return to_save
 
 
 def _atomic_write_text(path: Path, text: str, *, mode: int | None = None) -> None:
@@ -155,6 +214,11 @@ def load_config(config_path: Path | str | None = None) -> dict:
       values already written, e.g. me_user_id/me_display_name from T0.1) and
       persist the upgraded file.
 
+    The code-owned ``templates`` section is persisted as a DIFF only (see
+    :func:`_persistable`): the full defaults live in ``templates.py``, so the
+    returned config always reflects current defaults while the file carries only
+    the user's customizations. The returned dict is always fully merged.
+
     The sibling ``secrets.env`` is also ensured (chmod 600) on every load.
     """
     path = Path(config_path) if config_path is not None else CONFIG_PATH
@@ -163,13 +227,20 @@ def load_config(config_path: Path | str | None = None) -> dict:
 
     if not path.exists():
         cfg = copy.deepcopy(DEFAULT_CONFIG)
-        save_config(cfg, path)
+        # Persist the diff (empty templates here) so a fresh file never freezes
+        # code-owned template defaults; runtime still gets the full schema.
+        save_config(_persistable(cfg), path)
         return cfg
 
     existing = json.loads(path.read_text(encoding="utf-8"))
     merged = _deep_merge(DEFAULT_CONFIG, existing)
-    if merged != existing:
-        save_config(merged, path)
+    # Persist only the diff of the code-owned ``templates`` section (see
+    # _persistable). The full defaults stay in templates.py, so editing a default
+    # there always reaches runtime instead of being frozen in this file. Runtime
+    # still gets the fully-merged config returned below.
+    to_save = _persistable(merged)
+    if to_save != existing:
+        save_config(to_save, path)
     return merged
 
 

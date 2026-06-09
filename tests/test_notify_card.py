@@ -194,6 +194,9 @@ def test_tg_html_original_message_wrapped_in_expandable_blockquote():
     assert "hello there" in card[qstart:qend]            # message under the cut
     assert "API audit" not in card[qstart:qend]          # summary NOT in the quote
     assert "💬 API audit: enumerate group-chat system messages" in card
+    # Body stays plain inside the quote (no <code>); auto-link guard only splices a
+    # zero-width joiner into intra-word dots, of which this text has none.
+    assert "<blockquote expandable>hello there</blockquote>" in card
 
 
 def test_tg_html_link_is_outside_the_blockquote():
@@ -226,6 +229,28 @@ def test_tg_html_no_message_block_when_no_distinct_summary():
     card = notify.render_card([blank], [], now=NOW, mode="tg_html")
     assert "<blockquote" not in card
     assert "💬 just a short dm" in card
+
+
+def test_deautolink_breaks_domains_tg_html_only():
+    """Intra-word dots in fetched text get a zero-width WORD JOINER in tg_html so
+    Telegram won't auto-linkify "foo.py"/"bar.io"; plain/gchat stay untouched."""
+    WJ = "⁠"
+    item = _item(context_summary="see foo.py now", text="full body bar.io here")
+    # plain / gchat: no joiner spliced.
+    for mode in ("plain", "gchat"):
+        card = notify.render_card([item], [], now=NOW, mode=mode)
+        assert WJ not in card
+        assert "foo.py" in card
+    # tg_html: the dot inside the domain token carries the joiner, so the raw
+    # "foo.py" substring no longer appears but the visible chars are unchanged.
+    tg = notify.render_card([item], [], now=NOW, mode="tg_html")
+    assert f"foo.{WJ}py" in tg
+    assert "foo.py" not in tg              # raw domain substring is now broken
+    assert f"bar.{WJ}io" in tg
+    # Sentence-ending dots (space after) are NOT touched.
+    plain_text_item = _item(context_summary="done. ok", text="x")
+    tg2 = notify.render_card([plain_text_item], [], now=NOW, mode="tg_html")
+    assert WJ not in tg2
 
 
 def test_tg_html_empty_everything_omits_blockquote():
