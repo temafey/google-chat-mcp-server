@@ -147,24 +147,22 @@ def relative_time(iso_str, now: datetime | None, loc: dict | None = None) -> str
 
 
 def absolute_time(iso_str, now: datetime | None, loc: dict | None = None) -> str:
-    """Absolute send time of the message, e.g. '04 Jun 10:00'.
+    """Absolute send time of the message, e.g. '04.06 10:00'.
 
     Unlike :func:`relative_time` this never goes stale once the (static) digest
     lands in Telegram / Google Chat — it shows WHEN the message was actually sent,
     not its age at send-time. The timestamp is rendered in ``now``'s timezone
     (production: the config tz injected via :func:`_resolve_now`), falling back to
-    UTC when ``now`` is naive / None. Month abbreviations come from ``loc['months']``
-    (12-entry list) when supplied, else English. Empty string on a junk/absent date.
+    UTC when ``now`` is naive / None. The month is rendered as a zero-padded number
+    (``DD.MM HH:MM``), so the output is locale-independent. Empty string on a
+    junk/absent date.
     """
     dt = _parse_iso(iso_str)
     if dt is None:
         return ""
-    loc = loc or {}
     tz = now.tzinfo if (now is not None and now.tzinfo is not None) else timezone.utc
     local = dt.astimezone(tz)
-    months = loc.get("months") or _MONTHS_EN
-    mon = months[local.month - 1] if len(months) == 12 else _MONTHS_EN[local.month - 1]
-    return f"{local.day:02d} {mon} {local.hour:02d}:{local.minute:02d}"
+    return f"{local.day:02d}.{local.month:02d} {local.hour:02d}:{local.minute:02d}"
 
 
 def human_due(iso_str, loc: dict | None = None, now: datetime | None = None) -> str:
@@ -231,8 +229,14 @@ def in_quiet_hours(now: datetime, cfg: dict) -> bool:
 # Notifiability (deterministic — no LLM).
 # --------------------------------------------------------------------------- #
 def _matches_baseline(item: dict, cfg: dict) -> bool:
-    """BASELINE: direct_dm OR vip sender OR urgency keyword in text."""
-    if item.get("trigger") == "direct_dm":
+    """BASELINE: direct_dm OR user_mention OR vip sender OR urgency keyword.
+
+    A direct @mention of me in a room is always notifiable on its own — being
+    named is the signal, independent of urgency keywords or VIP status. Room-wide
+    ``broadcast`` (@all/@here) is deliberately NOT baseline: it still has to clear
+    the vip/urgency gate below, so chatty channels don't flood the inbox.
+    """
+    if item.get("trigger") in ("direct_dm", "user_mention"):
         return True
     if item.get("sender_id") in set(cfg.get("vip_senders") or []):
         return True

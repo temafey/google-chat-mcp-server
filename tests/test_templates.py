@@ -97,7 +97,7 @@ def test_compact_profile_is_single_line_no_message_no_link():
         [_item()], [], now=NOW, mode="plain", templates_cfg=_tcfg(active_profile="compact")
     )
     # Absolute send time (never goes stale), not a relative age, in the meta line.
-    assert "🟢 Mariia Ivanova · Mobile internal · 04 Jun 10:00" in card
+    assert "🟢 Mariia Ivanova · Mobile internal · 04.06 10:00" in card
     assert "💬 short human summary" in card
     assert "Original message" not in card  # compact hides the cut
     assert "🔗" not in card  # compact hides the link
@@ -118,7 +118,7 @@ def test_unknown_active_profile_falls_back_to_default_layout():
         [_item()], [], now=NOW, mode="plain", templates_cfg=_tcfg(active_profile="does-not-exist")
     )
     # Default labelled layout still renders (no crash, no bare placeholder).
-    assert "📍 Mobile internal · 🕒 04 Jun 10:00" in card
+    assert "📍 Mobile internal · 🕒 04.06 10:00" in card
     assert "$" not in card
 
 
@@ -351,10 +351,11 @@ def test_relative_time_localized_uk_declensions():
 
 def test_absolute_time_renders_send_time_not_age():
     # Absolute time shows WHEN the message was sent (never stale), in NOW's tz (UTC here).
+    # The month is a number, so the output is locale-independent.
     sent = "2026-06-04T10:00:00Z"
-    assert notify.absolute_time(sent, NOW) == "04 Jun 10:00"
-    assert notify.absolute_time(sent, NOW, RU) == "04 июн 10:00"
-    assert notify.absolute_time(sent, NOW, UK) == "04 чер 10:00"
+    assert notify.absolute_time(sent, NOW) == "04.06 10:00"
+    assert notify.absolute_time(sent, NOW, RU) == "04.06 10:00"
+    assert notify.absolute_time(sent, NOW, UK) == "04.06 10:00"
 
 
 def test_absolute_time_uses_now_timezone():
@@ -362,7 +363,7 @@ def test_absolute_time_uses_now_timezone():
     from zoneinfo import ZoneInfo
     sent = "2026-06-04T10:00:00Z"
     kyiv_now = datetime(2026, 6, 4, 15, 0, tzinfo=ZoneInfo("Europe/Kyiv"))  # UTC+3 in June
-    assert notify.absolute_time(sent, kyiv_now) == "04 Jun 13:00"
+    assert notify.absolute_time(sent, kyiv_now) == "04.06 13:00"
 
 
 def test_absolute_time_junk_or_missing_is_empty():

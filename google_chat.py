@@ -47,10 +47,22 @@ _user_display_name_cache: Dict[str, str] = {}
 # cache so a human-curated name always wins over a directory lookup.
 _user_aliases: Dict[str, str] = {}
 
+# Manual team/role/email overrides for the author roster:
+# {"users/<id>": {"team": "...", "role": "...", "email": "..."}}. Programmatic
+# installs (set_user_profile_overrides) win over the config file; both win over
+# the (sparse) domain directory in list_directory_authors.
+_user_profile_overrides: Dict[str, Dict[str, str]] = {}
+
 # Persisted directory-name cache (runtime file, lives OUTSIDE the repo under the
 # triage base dir). Shape: {"fetched_at": <iso8601>, "names": {"<id>": "<name>"}}.
 _DIRECTORY_CACHE_PATH = (
     Path.home() / ".claude-orchestrator" / "gchat-triage" / "name_cache.json"
+)
+# Triage config.json (owned by scripts/config.py). google_chat is the low-level
+# layer and must NOT import scripts.config (dependency inversion); it only needs
+# two keys (user_aliases, user_profiles), so it reads this JSON directly.
+_CONFIG_PATH = (
+    Path.home() / ".claude-orchestrator" / "gchat-triage" / "config.json"
 )
 DEFAULT_CALLBACK_URL = os.environ.get(
     'GOOGLE_OAUTH_REDIRECT_URI', 'http://localhost:8000/auth/callback'
@@ -325,6 +337,45 @@ def set_user_aliases(aliases: Optional[Dict[str, str]]) -> None:
         _user_aliases.update(aliases)
 
 
+def set_user_profile_overrides(overrides: Optional[Dict[str, Dict[str, str]]]) -> None:
+    """Install manual ``{"users/<id>": {team, role, email, location}}`` overrides.
+
+    Replaces any previously-installed overrides. Surfaced by
+    :func:`list_directory_authors`, where each sub-key wins over the domain
+    directory. A falsy argument clears all overrides.
+    """
+    _user_profile_overrides.clear()
+    if overrides:
+        for user_id, fields in overrides.items():
+            if isinstance(fields, dict):
+                _user_profile_overrides[user_id] = {
+                    k: v for k, v in fields.items()
+                    if k in ("team", "role", "email", "name", "location") and v
+                }
+
+
+def _load_config_overrides(config_path=None) -> Dict[str, Any]:
+    """Read ``user_aliases`` + ``user_profiles`` from the triage config.json.
+
+    Reads only the two keys the roster needs, degrading to empty dicts if the
+    file is absent/unreadable. Kept dependency-free (no ``scripts.config``
+    import) so the low-level layer stays standalone in the MCP server process,
+    which never runs the collector's config-install step.
+    """
+    path = Path(config_path) if config_path is not None else _CONFIG_PATH
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return {"user_aliases": {}, "user_profiles": {}}
+    aliases = cfg.get("user_aliases")
+    profiles = cfg.get("user_profiles")
+    return {
+        "user_aliases": aliases if isinstance(aliases, dict) else {},
+        "user_profiles": profiles if isinstance(profiles, dict) else {},
+    }
+
+
 def _directory_cache_path(cache_path=None) -> Path:
     return Path(cache_path) if cache_path is not None else _DIRECTORY_CACHE_PATH
 
@@ -405,12 +456,15 @@ def warm_directory_cache(
         return 0
 
     names: Dict[str, str] = {}
+    profiles: Dict[str, Dict[str, Optional[str]]] = {}
     try:
         service = build('people', 'v1', credentials=creds)
         page_token: Optional[str] = None
         while True:
             kwargs: Dict[str, Any] = {
-                "readMask": "names,emailAddresses,metadata",
+                # organizations carries the directory job title + department,
+                # which list_directory_authors surfaces as role + team.
+                "readMask": "names,emailAddresses,organizations,metadata",
                 "sources": ["DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"],
                 "pageSize": 1000,
             }
@@ -422,10 +476,22 @@ def warm_directory_cache(
                 display = person_names[0].get("displayName") if person_names else None
                 if not display:
                     continue
+                emails = person.get("emailAddresses") or []
+                email = emails[0].get("value") if emails else None
+                orgs = person.get("organizations") or []
+                org = orgs[0] if orgs else {}
+                team = org.get("department") or None
+                role = org.get("title") or None
                 for source in (person.get("metadata") or {}).get("sources", []):
                     sid = source.get("id")
                     if sid:
                         names[sid] = display
+                        profiles[sid] = {
+                            "name": display,
+                            "email": email,
+                            "team": team,
+                            "role": role,
+                        }
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
@@ -458,6 +524,9 @@ def warm_directory_cache(
         .isoformat()
         .replace("+00:00", "Z"),
         "names": names,
+        # Rich per-id directory profile (name/email/team/role). The flat
+        # `names` map is kept for the sender-name resolver's backward compat.
+        "profiles": profiles,
     }
     path = _directory_cache_path(cache_path)
     try:
@@ -480,6 +549,99 @@ def warm_directory_cache(
 
     _install_directory_names(names)
     return len(names)
+
+
+async def list_directory_authors(force: bool = False) -> Dict[str, Any]:
+    """List every in-domain Chat author from the Workspace directory.
+
+    Returns the roster of people resolvable via the domain directory (People
+    API ``listDirectoryPeople``), each keyed by the ``users/<id>`` value Chat
+    puts in ``sender.name``. This is the "who could post" org roster — the
+    whole domain profile directory — NOT a scan of who has actually sent
+    messages. READ-ONLY.
+
+    Reuses the same persisted, TTL'd cache as sender-name resolution
+    (:func:`warm_directory_cache`): a fresh cache is returned without touching
+    the network; otherwise the directory is re-fetched and persisted. Manual
+    ``user_aliases`` overrides (installed via :func:`set_user_aliases`) win
+    over directory names — mirroring :func:`get_user_display_name`'s
+    precedence — and alias-only ids not present in the directory (e.g. curated
+    external users) are appended.
+
+    Each author carries ``display_name``, ``email``, ``team`` (directory
+    department), ``role`` (directory job title) and ``location``; any of
+    email/team/role/location is ``None`` when neither the directory nor a config
+    override supplies it. ``location`` is override-only (no directory field).
+    Alias-only external ids carry only the curated name.
+
+    Args:
+        force: Re-fetch from the People API even if the cache is still fresh.
+
+    Returns:
+        ``{"author_count", "fetched_at", "source": "domain_directory",
+        "authors": [{"user_id", "display_name", "email", "team", "role",
+        "location"}, ...]}`` with ``authors`` sorted case-insensitively by
+        ``display_name``.
+    """
+    creds = get_credentials()
+    if not creds:
+        raise Exception("No valid credentials found. Please authenticate first.")
+
+    await asyncio.to_thread(warm_directory_cache, creds, force=force)
+    cached = _load_directory_cache() or {}
+    profiles = cached.get("profiles")
+    # Old-schema cache (names only, pre-profiles) → refetch once to enrich.
+    if profiles is None and not force:
+        await asyncio.to_thread(warm_directory_cache, creds, force=True)
+        cached = _load_directory_cache() or {}
+        profiles = cached.get("profiles")
+    profiles = profiles or {}
+
+    # Manual overrides win over the sparse directory. Programmatic installs
+    # (set_user_*) take precedence over the config file.
+    cfg = _load_config_overrides()
+    alias_map = {**cfg["user_aliases"], **_user_aliases}
+    # Per-key deep-merge so a partial programmatic override (e.g. just `team`)
+    # doesn't wipe sibling fields (`role`) supplied via the config file.
+    profile_map: Dict[str, Dict[str, str]] = {}
+    for src in (cfg["user_profiles"], _user_profile_overrides):
+        for uid, fields in src.items():
+            if isinstance(fields, dict):
+                profile_map.setdefault(uid, {}).update(fields)
+
+    def _row(user_id: str, prof: Dict[str, Any]) -> Dict[str, Optional[str]]:
+        ov = profile_map.get(user_id) or {}
+        return {
+            "user_id": user_id,
+            "display_name": alias_map.get(user_id) or ov.get("name") or prof.get("name"),
+            "email": ov.get("email") or prof.get("email"),
+            "team": ov.get("team") or prof.get("team"),
+            "role": ov.get("role") or prof.get("role"),
+            # location has no directory equivalent — override-only (HRIS roster).
+            "location": ov.get("location") or prof.get("location"),
+        }
+
+    authors: List[Dict[str, Optional[str]]] = []
+    seen: set = set()
+    for numeric_id, prof in profiles.items():
+        user_id = f"users/{numeric_id}"
+        authors.append(_row(user_id, prof))
+        seen.add(user_id)
+
+    # Curated ids not in the domain directory (external users / overrides-only):
+    # any id named via user_aliases OR carrying a user_profiles override.
+    for user_id in set(alias_map) | set(profile_map):
+        if user_id not in seen:
+            authors.append(_row(user_id, {}))
+            seen.add(user_id)
+
+    authors.sort(key=lambda a: (a["display_name"] or "").lower())
+    return {
+        "author_count": len(authors),
+        "fetched_at": cached.get("fetched_at"),
+        "source": "domain_directory",
+        "authors": authors,
+    }
 
 
 def resolve_one_via_people_get(
@@ -542,7 +704,42 @@ async def list_chat_spaces() -> List[Dict]:
     except Exception as e:
         raise Exception(f"Failed to list chat spaces: {str(e)}")
 
-async def list_space_messages(space_name: str, 
+
+def _compact_quote(msg: Dict) -> Optional[Dict]:
+    """Extract a compact quote/reply descriptor from a raw message, or None.
+
+    Google Chat's ``messages.list`` populates ``quotedMessageMetadata`` on
+    messages that quote another message (a "quote reply" — distinct from a
+    plain thread reply). The nested ``quotedMessageSnapshot.text`` carries the
+    quoted message's text **inline**, so the relationship is recoverable with
+    no extra API call. Verified live against 187 spaces, 2026-06-08.
+
+    Caveats from that probe: ``quoteType`` is ``REPLY`` for in-thread quotes
+    (``FORWARD`` for forwards); ``quotedMessageSnapshot.sender`` is documented
+    but empty in practice — only ``name`` reliably identifies the quoted
+    message's author resolution point. We therefore surface ``name`` (stable
+    pointer to the quoted message) + the inline snapshot ``text`` + ``type``,
+    plus ``sender`` only when the API actually provides it.
+
+    SAVE_TOKEN_MODE strips this field by default; this helper is the single
+    source of truth for re-surfacing it across every read path.
+    """
+    qmm = msg.get("quotedMessageMetadata")
+    if not qmm:
+        return None
+    snapshot = qmm.get("quotedMessageSnapshot") or {}
+    quote = {
+        "name": qmm.get("name"),
+        "type": qmm.get("quoteType"),
+        "text": snapshot.get("text"),
+    }
+    sender = snapshot.get("sender")
+    if sender:
+        quote["sender"] = sender
+    return quote
+
+
+async def list_space_messages(space_name: str,
                             start_date: Optional[datetime.datetime] = None,
                             end_date: Optional[datetime.datetime] = None) -> List[Dict]:
     """Lists messages from a specific Google Chat space with optional time filtering.
@@ -617,6 +814,9 @@ async def list_space_messages(space_name: str,
                 'text': msg.get('text'),
                 'thread': msg.get('thread')
             }
+            quoted = _compact_quote(msg)
+            if quoted:
+                filtered_msg['quoted'] = quoted
             filtered_messages.append(filtered_msg)
 
         return filtered_messages
@@ -885,7 +1085,7 @@ async def search_chat_messages(
             if sender_id != sender:
                 continue
             display = get_user_display_name(sender_obj, creds) if sender_obj else "Unknown"
-            hits.append({
+            hit = {
                 "space_name": sp["name"],
                 "space_display_name": sp.get("displayName"),
                 "message_name": m.get("name"),
@@ -894,7 +1094,11 @@ async def search_chat_messages(
                 "sender_display_name": display,
                 "text": m.get("text"),
                 "thread_name": (m.get("thread") or {}).get("name"),
-            })
+            }
+            quoted = _compact_quote(m)
+            if quoted:
+                hit["quoted"] = quoted
+            hits.append(hit)
 
     hits.sort(key=lambda h: h.get("create_time") or "", reverse=True)
     if limit is not None and limit > 0:

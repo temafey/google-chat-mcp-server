@@ -112,6 +112,12 @@ def _new_item_skeleton() -> dict:
         "sender_name": None,
         "created_time": None,
         "text": None,
+        # Quote-reply context (from quotedMessageMetadata): when the message
+        # quotes another, this is {name, type, text[, sender]} for the quoted
+        # message; None otherwise. Lets the digest resolve terse replies like
+        # "Any update on this?" to what they quote. Absent on pre-existing
+        # on-disk items, where .get("quoted") is falsy.
+        "quoted": None,
         "trigger": None,
         "detected_at": None,
         "priority": "unset",

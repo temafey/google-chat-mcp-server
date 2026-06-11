@@ -115,7 +115,8 @@ async def test_direct_mention_in_space_detected():
     # Full normalized shape (store.json item field names).
     assert set(items[0]) == {
         "space_name", "space_display", "space_type", "message_name",
-        "thread_name", "sender_id", "sender_name", "created_time", "text", "trigger",
+        "thread_name", "sender_id", "sender_name", "created_time", "text",
+        "quoted", "trigger",
     }
 
 

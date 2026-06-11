@@ -167,6 +167,11 @@ def _normalize(
         "sender_name": gchat.get_user_display_name(sender, creds) if sender else None,
         "created_time": message.get("createTime"),
         "text": message.get("text"),
+        # Quote-reply context: when this message quotes another (e.g. a terse
+        # "Any update on this?" that quotes the message it refers to), `quoted`
+        # carries the quoted message's text inline so the digest/triage layer
+        # can resolve what "this" points at — None for non-quoting messages.
+        "quoted": gchat._compact_quote(message),
         "trigger": trigger,
     }
 

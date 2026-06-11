@@ -11,6 +11,7 @@ from google_chat import (
     search_chat_messages as _search_chat_messages,
     list_space_members as _list_space_members,
     find_users_by_name as _find_users_by_name,
+    list_directory_authors as _list_directory_authors,
     whoami as _whoami,
     DEFAULT_CALLBACK_URL,
     set_token_path,
@@ -62,8 +63,13 @@ async def get_space_messages(space_name: str,
         end_date: Optional end date in YYYY-MM-DD format
     
     Returns:
-        List of message objects from the space matching the time criteria
-        
+        List of message objects from the space matching the time criteria.
+        Each is trimmed to {sender, createTime, text, thread} in
+        SAVE_TOKEN_MODE; a message that is a quote reply additionally carries
+        `quoted: {name, type, text[, sender]}` — the quoted message's
+        resource name plus its text inline (no extra API call). The `quoted`
+        key is omitted entirely for messages that don't quote anything.
+
     Raises:
         ValueError: If the date format is invalid or dates are in wrong order
     """
@@ -190,6 +196,11 @@ async def search_chat_messages(
     Returns:
         A wrapper dict: { sender, match_mode, start_date, end_date,
         spaces_scanned, spaces_failed, errors[], total_matches, results[] }.
+        Each result carries the usual fields plus, when the message is a
+        quote reply, `quoted: {name, type, text[, sender]}` — the quoted
+        message's resource name and its text inline (no extra API call), so
+        terse replies like "Any update on this?" can be resolved to what
+        they quote. Absent on messages that don't quote anything.
         Per-space failures (403, 404, etc.) are collected in `errors[]`
         and do not abort the whole search.
     """
@@ -290,6 +301,46 @@ async def find_users_by_name(
 
 
 @mcp.tool()
+async def list_chat_authors(force: bool = False) -> Dict[str, Any]:
+    """List every in-domain Chat author from the Workspace directory.
+
+    Returns the full roster of people resolvable via the domain directory,
+    each keyed by the `users/<id>` value Chat puts in `sender.name`. This is
+    the org "who could post" roster — the whole domain profile directory —
+    NOT a scan of who has actually sent messages (for that, scan spaces with
+    `search_chat_messages` / `get_space_messages`). READ-ONLY.
+
+    Backed by the same persisted, 12-hour-TTL directory cache that powers
+    sender-name resolution: a fresh cache is returned instantly without
+    hitting the network; otherwise the directory is re-fetched once and
+    persisted. Manual `user_aliases` overrides win over directory names.
+
+    Requires the `directory.readonly` OAuth scope. If your `token.json`
+    predates that scope, the directory fetch silently yields whatever was
+    last cached (possibly empty) rather than erroring — re-auth to populate.
+
+    Args:
+        force: Re-fetch from the People API even if the cache is still fresh
+            (default False — serve the cache when it's within TTL).
+
+    Each author carries `display_name`, `email`, `team` (directory
+    department), `role` (directory job title) and `location`. Any of
+    email/team/role/location is null when neither the directory nor a config
+    override supplies it — and the domain directory is typically sparse on
+    team/role (and has no location field at all). To fill those in, add a
+    `user_profiles` mapping to the triage config.json
+    (`{"users/<id>": {"team": "...", "role": "...", "email": "...",
+    "location": "..."}}`); each sub-key WINS over the directory value.
+
+    Returns:
+        { author_count, fetched_at, source: "domain_directory",
+          authors: [{user_id, display_name, email, team, role, location}, ...] }
+        sorted by display_name.
+    """
+    return await _list_directory_authors(force=force)
+
+
+@mcp.tool()
 async def whoami() -> Dict[str, Any]:
     """Resolve the authenticated user's own Google Chat identity.
 
@@ -345,7 +396,11 @@ async def list_messages_for_me(
     Returns:
         A list of normalized item dicts, newest-first, each with keys:
         `space_name, space_display, space_type, message_name, thread_name,
-        sender_id, sender_name, created_time, text, trigger`.
+        sender_id, sender_name, created_time, text, quoted, trigger`.
+        `quoted` is {name, type, text[, sender]} when the message is a quote
+        reply (the quoted message's resource name + its text inline, no extra
+        API call) — so a terse "Any update on this?" can be resolved to what
+        it quotes — and None otherwise.
 
     Raises:
         ValueError: If a YYYY-MM-DD date string is malformed or dates are in
