@@ -6,6 +6,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Google Chat + Google Calendar MCP (Model Context Protocol) server that exposes Chat and Calendar operations as MCP tools AI assistants can invoke. The MCP transport is **stdio**, so stdout must remain clean for protocol messages. One OAuth token covers both APIs.
 
+## Code Navigation & Research (Serena MCP — PREFERRED)
+
+**For understanding or navigating this codebase, prefer the `serena` MCP tools over plain `Grep`/`Read`/`Glob`.** Serena is a language-server-backed semantic toolkit (configured in the gitignored `.mcp.json`, project rooted at this repo). It returns *symbols and their relationships* instead of raw text matches, which is faster, more precise, and far more token-efficient than reading whole files. Plain `Read`/`Grep` waste context by pulling in entire files when you only needed one function.
+
+### When to use Serena (default for code research)
+
+- **Exploring an unfamiliar file** → `mcp__serena__get_symbols_overview` (the recommended FIRST call — returns the file's classes/functions/methods without reading the body).
+- **Finding a definition** → `mcp__serena__find_symbol` (name-path search: exact, suffix, or `substring_matching`; pass `include_body: true` only when you need the source). Prefer this over grepping for `def name`.
+- **Impact analysis before editing** → `mcp__serena__find_referencing_symbols` (who calls/uses a symbol). Use this BEFORE changing any shared function/class — e.g. before touching `notify._esc`, `get_credentials`, or a template placeholder.
+- **Pattern/text search** → `mcp__serena__search_for_pattern` (regex across files, with context lines and glob include/exclude). Use instead of `Grep` when you also want surrounding context or code-only filtering.
+- **Navigation** → `mcp__serena__list_dir`, `mcp__serena__find_file`.
+- **Symbol-aware editing** → `mcp__serena__replace_symbol_body`, `insert_after_symbol`, `insert_before_symbol`, `replace_regex` (edit by symbol identity, not brittle line offsets).
+- **Cross-session project knowledge** → memory tools `write_memory` / `read_memory` / `list_memories` / `edit_memory` / `delete_memory` (Serena's own file-backed store — distinct from this agent's `MEMORY.md`).
+
+Recommended flow for a research task: `get_symbols_overview` → `find_symbol` (with body) → `find_referencing_symbols` to map impact, then edit. Reach for `find_symbol` over reading a whole module; reach for `find_referencing_symbols` over grepping for every call site.
+
+### When NOT to use Serena
+
+- The exact file + line is already known → just `Read` that slice.
+- Non-code files (Markdown, JSON, `.env`, logs) → `Read` / `Grep` (Serena's strength is symbol semantics).
+- Library/framework API questions → `context7` / `docfork` (see global instructions), not Serena.
+- Serena's first call after a session start may be slow (it boots a language server / `uvx` may fetch on first run); that latency is one-time, not a reason to fall back to `Grep` for the rest of the session.
+
 ## Commands
 
 ```bash
