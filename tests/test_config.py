@@ -252,3 +252,89 @@ def test_is_active_default_now_uses_wall_clock():
     cfg = copy.deepcopy(config.DEFAULT_CONFIG)
     cfg["mute_until"] = "2099-01-01T00:00:00Z"
     assert config.is_active(cfg) is False
+
+
+# --------------------------------------------------------------------------- #
+# analyze block — defaults and deep-merge behaviour.
+# --------------------------------------------------------------------------- #
+
+def test_analyze_defaults_present_when_no_config_key(tmp_path):
+    """A config.json with no ``analyze`` key gets the full analyze block filled in."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"me_user_id": "users/1"}))
+
+    cfg = config.load_config(cfg_path)
+
+    analyze = cfg["analyze"]
+    assert analyze["enabled"] is False
+    assert analyze["run_in_cron"] is False
+    assert analyze["adapters"]["order"] == ["claude"]
+    assert analyze["adapters"]["claude"]["model"] == "claude-haiku-4-5-20251001"
+    assert analyze["escalate_to_thread"] is True
+    assert analyze["thread_max_messages"] == 30
+    assert analyze["max_items_per_run"] == 20
+    assert analyze["min_confidence_to_store"] == 0.5
+    assert analyze["timeout_seconds"] == 60
+
+
+def test_analyze_defaults_present_on_fresh_config(tmp_path):
+    """``load_config`` with no pre-existing file returns the full analyze block."""
+    cfg_path = tmp_path / "config.json"
+    assert not cfg_path.exists()
+
+    cfg = config.load_config(cfg_path)
+
+    analyze = cfg["analyze"]
+    assert analyze["enabled"] is False
+    assert analyze["run_in_cron"] is False
+    assert analyze["adapters"]["order"] == ["claude"]
+    assert analyze["adapters"]["claude"]["model"] == "claude-haiku-4-5-20251001"
+    assert analyze["escalate_to_thread"] is True
+    assert analyze["thread_max_messages"] == 30
+    assert analyze["max_items_per_run"] == 20
+    assert analyze["min_confidence_to_store"] == 0.5
+    assert analyze["timeout_seconds"] == 60
+
+
+def test_analyze_partial_override_deep_merges(tmp_path):
+    """A config.json with only ``analyze.enabled`` set keeps all other analyze defaults.
+
+    Critically, the nested ``adapters.order`` and ``adapters.claude.model`` must
+    survive the deep-merge even though they were not present in the override.
+    """
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"analyze": {"enabled": True}}))
+
+    cfg = config.load_config(cfg_path)
+
+    analyze = cfg["analyze"]
+    # The overridden key wins.
+    assert analyze["enabled"] is True
+    # All other keys come from DEFAULT_CONFIG.
+    assert analyze["run_in_cron"] is False
+    assert analyze["escalate_to_thread"] is True
+    assert analyze["thread_max_messages"] == 30
+    assert analyze["max_items_per_run"] == 20
+    assert analyze["min_confidence_to_store"] == 0.5
+    assert analyze["timeout_seconds"] == 60
+    # Nested adapters are preserved in full.
+    assert analyze["adapters"]["order"] == ["claude"]
+    assert analyze["adapters"]["claude"]["model"] == "claude-haiku-4-5-20251001"
+
+
+def test_analyze_nested_adapter_partial_override_deep_merges(tmp_path):
+    """Overriding only ``adapters.order`` keeps the nested ``adapters.claude`` dict."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"analyze": {"adapters": {"order": ["claude", "gemini"]}}})
+    )
+
+    cfg = config.load_config(cfg_path)
+
+    analyze = cfg["analyze"]
+    assert analyze["adapters"]["order"] == ["claude", "gemini"]
+    # Sibling key inside adapters still present from defaults.
+    assert analyze["adapters"]["claude"]["model"] == "claude-haiku-4-5-20251001"
+    # Top-level analyze defaults also intact.
+    assert analyze["enabled"] is False
+    assert analyze["thread_max_messages"] == 30

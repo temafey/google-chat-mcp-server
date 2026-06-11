@@ -124,6 +124,13 @@ def _new_item_skeleton() -> dict:
         "priority_reason": None,
         "context_summary": None,
         "context_confidence": None,
+        # AI-analysis results written by the analysis stage via set_fields (verbatim,
+        # no status change). Absent on pre-existing on-disk items, where .get(…) is
+        # falsy — same precedent as "quoted" above.
+        "msg_type": None,          # message-type taxonomy: direct_request|question|decision_needed|status_update|fyi|social|continuation|unclear
+        "analyzed_at": None,       # ISO timestamp when analysis last ran on this item
+        "analyzed_by": None,       # provenance string, e.g. "claude/haiku"
+        "thread_status": None,     # Tier-2 thread state: awaiting_me|awaiting_others|resolved|fyi; None until a thread summary runs
         "status": "new",
         "snooze_until": None,
         "my_promise": None,

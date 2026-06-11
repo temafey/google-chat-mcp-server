@@ -229,6 +229,57 @@ def test_set_fields_unknown_item_raises(store_path):
         store.set_fields(s, "deadbeef", now=FIXED, last_notified="2026-06-04T13:30:00Z")
 
 
+# --- analysis result fields (A3) ------------------------------------------
+
+def test_new_item_carries_analysis_fields_defaulting_to_none(store_path):
+    """A freshly seeded item exposes all four analysis fields, each None."""
+    s = store.load(store_path)
+    iid = store.upsert_item(s, _sample_item(), now=FIXED)
+    item = s["items"][iid]
+    assert item["msg_type"] is None
+    assert item["analyzed_at"] is None
+    assert item["analyzed_by"] is None
+    assert item["thread_status"] is None
+
+
+def test_set_fields_writes_analysis_fields_verbatim_no_status_or_history_change(store_path):
+    """set_fields writes analysis fields verbatim, leaves status and history untouched."""
+    s = store.load(store_path)
+    iid = store.upsert_item(s, _sample_item(), now=FIXED)
+    item = s["items"][iid]
+    status_before = item["status"]
+    hist_before = len(item["history"])
+
+    store.set_fields(
+        s, iid,
+        msg_type="question",
+        analyzed_at="2026-06-11T10:00:00Z",
+        analyzed_by="claude/haiku",
+        thread_status="awaiting_me",
+    )
+
+    assert item["msg_type"] == "question"
+    assert item["analyzed_at"] == "2026-06-11T10:00:00Z"
+    assert item["analyzed_by"] == "claude/haiku"
+    assert item["thread_status"] == "awaiting_me"
+    assert item["status"] == status_before          # status must not change
+    assert len(item["history"]) == hist_before      # no history entry added
+
+
+def test_old_item_missing_analysis_fields_behaves_gracefully():
+    """An old on-disk item lacking the four keys returns falsy via .get() — no KeyError."""
+    old_item = {
+        "id": "abc123",
+        "status": "new",
+        "text": "some message",
+        "history": [],
+    }
+    assert not old_item.get("msg_type")
+    assert not old_item.get("analyzed_at")
+    assert not old_item.get("analyzed_by")
+    assert not old_item.get("thread_status")
+
+
 # --- persistence roundtrip ------------------------------------------------
 
 def test_save_load_roundtrip_creates_parent_dir(store_path):

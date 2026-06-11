@@ -74,6 +74,22 @@ DEFAULT_CONFIG: dict = {
     # ``profiles`` / ``locales`` / ``variants`` to customise. Deep-merged on load, so a
     # custom value wins and new default keys are filled in on upgrade.
     "templates": copy.deepcopy(DEFAULT_TEMPLATES),
+    # AI-analysis stage (opt-in). Disabled by default; enable via config.json
+    # "analyze": {"enabled": true}.  Deep-merged on load so partial overrides keep
+    # all other defaults (including nested adapters.order / adapters.claude.model).
+    "analyze": {
+        "enabled": False,
+        "run_in_cron": False,
+        "adapters": {
+            "order": ["claude"],
+            "claude": {"model": "claude-haiku-4-5-20251001"},
+        },
+        "escalate_to_thread": True,
+        "thread_max_messages": 30,
+        "max_items_per_run": 20,
+        "min_confidence_to_store": 0.5,
+        "timeout_seconds": 60,
+    },
 }
 
 # Commented placeholders only — NO real values ever land here.
