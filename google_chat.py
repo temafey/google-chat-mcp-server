@@ -990,6 +990,61 @@ def _list_messages_sync(
     return messages
 
 
+def _list_thread_messages_sync(
+    creds: Credentials,
+    space_name: str,
+    thread_name: str,
+    *,
+    max_messages: int = 30,
+) -> List[Dict]:
+    """Synchronous paginated ``messages.list`` filtered to a single thread.
+
+    Uses the ``thread.name = "..."`` filter DSL (documented in
+    ``docs/google-chat-api-guide.md``, confirmed supported by the Chat API).
+    Paginates until exhausted, then truncates to the most-recent
+    *max_messages* and returns them in chronological order (oldest first).
+
+    READ-ONLY: only calls ``messages.list``. Never writes to Chat.
+
+    Args:
+        creds:        Valid OAuth credentials.
+        space_name:   e.g. ``"spaces/AAQA3S7I39E"``.
+        thread_name:  e.g. ``"spaces/AAQA3S7I39E/threads/T123"``.
+        max_messages: Upper bound on returned messages (default 30, per
+                      ``analyze.thread_max_messages`` config key).
+
+    Returns:
+        List of raw message dicts, oldest first, at most *max_messages*.
+    """
+    service = build('chat', 'v1', credentials=creds)
+    filter_str = f'thread.name = "{thread_name}"'
+
+    messages: List[Dict] = []
+    page_token: Optional[str] = None
+    while True:
+        kwargs: Dict[str, Any] = {
+            "parent": space_name,
+            "pageSize": 100,
+            "filter": filter_str,
+            # Explicit ascending order so the most-recent-N truncation below
+            # (messages[-max_messages:]) is provably correct — the API default
+            # ordering is unspecified (docs/google-chat-api-guide.md:153).
+            "orderBy": "create_time ASC",
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        resp = service.spaces().messages().list(**kwargs).execute()
+        messages.extend(resp.get("messages", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    # Truncate to the most-recent N, then sort oldest→newest for the prompt.
+    if len(messages) > max_messages:
+        messages = messages[-max_messages:]
+    return messages
+
+
 def _resolve_me_sync(creds: Credentials) -> str:
     """Return the authenticated user's Chat sender ID, i.e. 'users/<id>'.
 
