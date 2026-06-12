@@ -18,10 +18,10 @@ Chat Triage Assistant. Orchestrator-owned. Modeled on `CHAT-TRIAGE-BUILD-STATUS.
 | A2 `analysis_prompts.py` | A | **verified** | — | 59 tests | PASS (3 noted: 2 LOW + 1 MEDIUM residual) | Pure CLASSIFY+SUMMARIZE builders; delimiter-forging neutralized (`</message>`→`< /message>`). RESIDUAL: space-insertion neutralization is model-dependent (tracked, revisit GATE D). Minor D-5 SUMMARIZE-header wording drift. |
 | A3 store fields | A | **verified** | — | 3 tests; 20 in test_store | PASS (no defects) | Added `msg_type/analyzed_at/analyzed_by/thread_status` (default `None`) between `context_confidence` and `status`; `set_fields` untouched (no status/history change). |
 | A4 config block | A | **verified** | — | 4 tests; 23 in test_config | PASS (no defects) | `analyze` block in `DEFAULT_CONFIG`; `_deep_merge` already recurses (no logic change); defaults OFF. Note: `_persistable` keeps `analyze` (user-state, persists on first load — intentional). |
-| B1 `analyze_mentions.py` | B | todo | A1,A2,A3,A4 | — | — | Orchestrating script: gate on `analyze.enabled`; select `new & priority=="unset" & not analyzed`; Tier-0 pre-filter; Tier-1 classify; `set_fields` (NO status change); run-lock + logging; honor caps/timeout/min_confidence; cache. NEW file. |
+| B1 `analyze_mentions.py` | B | **verified** | A1,A2,A3,A4 | 54 tests; full suite 436 | PASS (after fix) | Orchestrating script: gate on `analyze.enabled`; select `new & priority=="unset" & not analyzed`; Tier-0 pre-filter; Tier-1 classify; run-lock + logging; honor caps/timeout/min_confidence; cache. First verifier pass found a **CRITICAL test-isolation bug** (tests wrote the live prod store via `store_path=None`) — see Incident below. Fixed via `tests/conftest.py` autouse net (`GCHAT_TRIAGE_STORE` env + `DEFAULT_STORE_PATH` patch) + explicit tmp paths; LOW deviation resolved (`item.update`→`store.set_fields`). Re-verified PASS: prod store items md5 identical before/after full suite, subprocess-safe, no KeyError regression, prod semantics preserved. |
 | C1 Tier-2 thread escalation | C | todo | B1 | — | — | On `context_sufficient=false`, fetch thread by `thread_name` (`gchat._list_messages_sync` + filter), SUMMARIZE, store summary + `thread_status`. Bounded by `thread_max_messages`. |
 | D1 cron integration | D | todo | C1 | — | — | `analyze.run_in_cron` -> `triage_cron.sh` chains `collect && analyze && notify`; analyze self-gates; `install_cron.sh` unaffected. |
-| D2 notify/template unify | D | todo | C1 | — | — | Fix dead `"urgent"` token (-> `high/normal/low`); ensure `context_summary` escaped via `_esc`; optional `msg_type` variant / quiet-hours bypass (user decides at GATE D). |
+| D2 notify/template unify | D | todo | C1 | — | — | Fix dead `"urgent"` token at `templates.py:158` (-> `high/normal/low`); **make AI `priority` drive digest ORDERING** (GATE-B1 finding: high item is currently buried under the attention-tier sort — `_priority_icon` shows the icon but ordering ignores priority); ensure `context_summary` escaped via `_esc` and surfaced; optional `msg_type` variant / quiet-hours bypass for `high` (user decides at GATE D). Icon map today: high/urgent→🔴, medium→🟡, normal→🟢, else ⚪. |
 | D3 adapter router (optional) | D | todo | B1 | — | — | `codex`/`gemini` adapters behind `adapters.order`. Deferrable. |
 
 ## Gates
@@ -29,7 +29,7 @@ Chat Triage Assistant. Orchestrator-owned. Modeled on `CHAT-TRIAGE-BUILD-STATUS.
 | Gate | After wave | State | Evidence |
 |---|---|---|---|
 | GATE A1 (unit + live smoke) | A | **PASSED** (2026-06-11) | Integrated A1+A2 live: probe `True`; real 1306-char CLASSIFY prompt → live haiku → schema-valid JSON. Deictic continuation correctly classified `type=continuation, context_sufficient=false` (validates the Tier-1→Tier-2 trigger, D-3). Config merges (`enabled=False`, `order=['claude']`); store fields default `None`; legacy items `.get()` falsy. Full suite **382 passed**. |
-| GATE B1 (read-only-ish e2e) | B | pending | Run on a COPY of live store w/ `enabled=true` -> priority/msg_type/context_summary populated on real items; re-run idempotent; adapter-down -> graceful no-op; `status` unchanged; NO network writes. Demo digest-with-priorities. |
+| GATE B1 (read-only-ish e2e) | B | **PASSED** (2026-06-12) | Live haiku run on a COPY (`/tmp/gate-b1`, fully isolated config+store+locks+logs) of the recovered 99-item store, `enabled=true`, `--limit 5`. Run 1: `selected=5 stored=5` — all got msg_type/priority/priority_reason/context_summary/context_confidence/analyzed_by=`claude/haiku`. Sound classifications: "extremely important" → `high`(🔴) conf 0.92; PO request → `normal`; social/fyi → `normal`(🟢). Run 2 (idempotency): advanced to a DIFFERENT 5 (`selected=5 stored=2 deferred=3`); original 5 byte-identical (analyzed_at unchanged) — already-analyzed never re-processed. The 3 DEFER items are all `msg_type=continuation, priority=unset, thread_status=None` = the exact Wave-C handoff predicate (live B1↔C1 proof). All 10 analyzed still `status==new`, history unchanged. Prod store untouched (99 items, md5 `fb94254dbaba` identical). Adapter-down/dry-run covered by the 54 unit tests. Digest renders priority icons via `notify._priority_icon` (high→🔴, normal→🟢). NOTE: priority does NOT yet drive digest ORDERING (high item buried under attention-tier sort) — that wiring is D2. |
 | GATE C (Tier-2) | C | pending | Real EP-53867 continuation -> Tier-1 flags insufficient -> Tier-2 escalates -> correct priority + thread summary. |
 | GATE D (final) | D | pending | Enabled end-to-end on store copy: collect -> analyze (sets priority) -> notify (priority icon + detailed profile). Adapter failure degrades to today's LLM-free behavior. Full suite green. |
 
@@ -72,6 +72,26 @@ tree**. All CONFIRMED except minor name drift; one baseline issue to resolve bef
   verifier protocol (verifiers diff pytest before/after). Resolution chosen with user:
   _TBD_.
 
+## Incident — test suite overwrote the live triage store (2026-06-11/12)
+
+- **What:** `tests/test_analyze_mentions.py` made ~17 non-dry-run `run_analysis(..., store_path=None)`
+  calls. `store._resolve_path(None)` → `DEFAULT_STORE_PATH` = the REAL prod store
+  (`~/.claude-orchestrator/gchat-triage/store.json`), so every `pytest` run (B1 build + verification)
+  overwrote live data with test fixtures. The independent B1 verifier caught it.
+- **Damage:** live store knocked down to 3 synthetic test items. The `*/5` cron collector self-healed
+  recent mentions (id-keyed upsert) but older untriaged `new` items + any lifecycle state were lost.
+  Production `analyze` path was NOT implicated (cron logged `skip: analyze-disabled`) — corruption was
+  purely pytest writing the prod path.
+- **Recovery (user-approved "restore + merge"):** under a blocking `flock` on `collect.lock` (serialized
+  with the cron), merged `store.json.prebackfill.bak` (Jun-5, 86 items incl 3 triaged) ∪ 13 cron-recovered
+  recent real items, dropped the 3 test items → **99 items (3 triaged + 96 new)**, 0 test pollution.
+  Safety copies: `store.json.pre-restore-<ts>.bak`, `store.json.restored-99items-safekeep`.
+- **Root-cause fix (verified):** `tests/conftest.py` function-scoped autouse fixture redirects EVERY test
+  away from prod via BOTH `GCHAT_TRIAGE_STORE` env (survives subprocess) AND `DEFAULT_STORE_PATH` patch;
+  the 15 `store_path=None` calls made explicit tmp paths. Re-verified: full-suite run leaves prod `items`
+  md5 byte-identical. **Rule going forward: never call `run_analysis`/`store.save` with `store_path=None`
+  in tests; the conftest net is the backstop.**
+
 ## Open questions (surface at the listed gate)
 
 - **GATE B1:** batch several new items into one haiku call for cost, or one-call-per-item?
@@ -90,5 +110,16 @@ tree**. All CONFIRMED except minor name drift; one baseline issue to resolve bef
   (+111). GATE A1 PASSED (integrated live haiku smoke). Tracked residual: A2 space-insertion
   injection neutralization is model-dependent — revisit at GATE D. Open: A2 whitespace-only-quoted
   test naming (LOW), SUMMARIZE header wording vs D-5 (LOW) — cosmetic, not blocking.
+- 2026-06-11/12 — B1 (`analyze_mentions.py` + 54 tests) built; first independent verifier returned FAIL
+  on a CRITICAL test-isolation bug (pytest overwrote the live store via `store_path=None`). Incident
+  contained; live store recovered to 99 items (restore Jun-5 backup ∪ cron-recovered recent, user-approved).
+  Root cause fixed (`tests/conftest.py` autouse isolation net) + LOW deviation resolved
+  (`item.update`→`store.set_fields`). Re-verified PASS: prod store byte-identical across full suite,
+  subprocess-safe, no regression. Full suite **436 passed**. B1 = verified. Next: GATE B1 (live, on a copy).
+- 2026-06-12 — GATE B1 PASSED. Live haiku on an isolated copy of the recovered 99-item store: 2 batches of 5,
+  classifications sound (high/normal + continuation→DEFER for Wave C), idempotent, status/history untouched,
+  prod store byte-identical. Surfaced D2 requirement: priority must drive digest ordering (not just icon).
+  Recovery artifacts retained in the runtime dir: `store.json.pre-restore-<ts>.bak`,
+  `store.json.restored-99items-safekeep`. Open (GATE B1): batch N items per haiku call vs one-call-per-item.
 </content>
 </invoke>
