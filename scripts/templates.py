@@ -155,7 +155,7 @@ DEFAULT_TEMPLATES: dict = {
     # louder ``detailed`` profile, regardless of its priority.
     "variants": [
         {"when": {"pinned": [True]}, "profile": "detailed"},
-        {"when": {"priority": ["urgent", "high"]}, "profile": "detailed"},
+        {"when": {"priority": ["high"]}, "profile": "detailed"},
     ],
 }
 

@@ -83,6 +83,8 @@ DEFAULT_CONFIG: dict = {
         "adapters": {
             "order": ["claude"],
             "claude": {"model": "claude-haiku-4-5-20251001"},
+            "gemini": {"model": "gemini-2.5-flash"},
+            "codex": {"model": "gpt-4o"},
         },
         "escalate_to_thread": True,
         "thread_max_messages": 30,

@@ -31,9 +31,14 @@ from scripts.analysis_adapters import (
     AnalysisRequest,
     AnalysisResult,
     ClaudeAdapter,
+    CodexAdapter,
+    GeminiAdapter,
     _build_clean_env,
+    _extract_codex_agent_message,
     _extract_inner_json,
     _short_model_name,
+    _short_model_name_codex,
+    _short_model_name_gemini,
     first_available,
 )
 
@@ -492,6 +497,570 @@ class TestBuildCleanEnv(unittest.TestCase):
             env = _build_clean_env()
         self.assertNotIn("MY_CUSTOM_SECRET", env)
         self.assertNotIn("DB_PASSWORD", env)
+
+
+# ---------------------------------------------------------------------------
+# GeminiAdapter — available() gate
+# ---------------------------------------------------------------------------
+
+class TestGeminiAdapterAvailable(unittest.TestCase):
+
+    def test_true_when_which_finds_gemini(self):
+        adapter = GeminiAdapter()
+        with patch("shutil.which", return_value="/usr/local/bin/gemini"):
+            self.assertTrue(adapter.available())
+
+    def test_false_when_which_returns_none(self):
+        adapter = GeminiAdapter()
+        with patch("shutil.which", return_value=None):
+            self.assertFalse(adapter.available())
+
+    def test_cached_after_first_call(self):
+        adapter = GeminiAdapter()
+        with patch("shutil.which", return_value="/usr/bin/gemini") as mock_which:
+            adapter.available()
+            adapter.available()
+        mock_which.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# GeminiAdapter — registered in _DEFAULT_REGISTRY
+# ---------------------------------------------------------------------------
+
+class TestGeminiAdapterRegistered(unittest.TestCase):
+
+    def test_registered_in_default_registry(self):
+        from scripts.analysis_adapters import _DEFAULT_REGISTRY
+        self.assertIn("gemini", _DEFAULT_REGISTRY)
+        self.assertIsInstance(_DEFAULT_REGISTRY["gemini"], GeminiAdapter)
+
+
+# ---------------------------------------------------------------------------
+# GeminiAdapter — run() happy path
+# ---------------------------------------------------------------------------
+
+class TestGeminiAdapterRunSuccess(unittest.TestCase):
+
+    def _make_gemini_envelope(self, result_text: str) -> str:
+        """Build a minimal Gemini outer envelope JSON string."""
+        return json.dumps({
+            "response": result_text,
+            "stats": {"models": {}, "tools": {}, "files": {}},
+        })
+
+    def _run_with_inner(self, inner_dict: dict, mode: str = "classify") -> AnalysisResult:
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode=mode, prompt="test prompt", model="gemini-2.5-flash")
+        envelope_text = self._make_gemini_envelope(json.dumps(inner_dict))
+        proc = _make_completed_proc(stdout=envelope_text)
+        with patch("subprocess.run", return_value=proc):
+            return adapter.run(req)
+
+    def test_ok_true_on_valid_inner_json(self):
+        result = self._run_with_inner({"category": "incident", "confidence": 0.9})
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.error)
+
+    def test_data_equals_parsed_inner_dict(self):
+        inner = {"category": "question", "confidence": 0.7}
+        result = self._run_with_inner(inner)
+        self.assertEqual(result.data, inner)
+
+    def test_provenance_starts_with_gemini(self):
+        result = self._run_with_inner({"x": 1})
+        self.assertTrue(result.adapter.startswith("gemini/"))
+
+    def test_mode_propagated(self):
+        result = self._run_with_inner({"x": 1}, mode="summarize")
+        self.assertEqual(result.mode, "summarize")
+
+
+# ---------------------------------------------------------------------------
+# GeminiAdapter — run() failure modes
+# ---------------------------------------------------------------------------
+
+class TestGeminiAdapterRunFailures(unittest.TestCase):
+
+    def _make_gemini_envelope(self, result_text: str) -> str:
+        return json.dumps({"response": result_text, "stats": {}})
+
+    def test_cli_not_found_returns_ok_false(self):
+        adapter = GeminiAdapter()
+        req = AnalysisRequest(mode="classify", prompt="p")
+        with patch("shutil.which", return_value=None):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIn("not found", result.error.lower())
+
+    def test_timeout_returns_ok_false(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p", timeout_seconds=5)
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="gemini", timeout=5)):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIn("timeout", result.error.lower())
+
+    def test_timeout_does_not_raise(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p", timeout_seconds=5)
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="gemini", timeout=5)):
+            result = adapter.run(req)
+        self.assertIsInstance(result, AnalysisResult)
+
+    def test_nonzero_exit_returns_ok_false(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        proc = _make_completed_proc(stdout="", returncode=1, stderr="auth error")
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+
+    def test_nonzero_exit_does_not_raise(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        proc = _make_completed_proc(stdout="", returncode=2)
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertIsInstance(result, AnalysisResult)
+
+    def test_empty_stdout_returns_ok_false(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        proc = _make_completed_proc(stdout="", returncode=0)
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIn("empty", result.error.lower())
+
+    def test_non_json_stdout_returns_ok_false(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        proc = _make_completed_proc(stdout="not json", returncode=0)
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+
+    def test_envelope_error_key_returns_ok_false(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        envelope = json.dumps({"error": {"type": "AuthError", "message": "not authenticated"}})
+        proc = _make_completed_proc(stdout=envelope, returncode=0)
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIn("error", result.error.lower())
+
+    def test_envelope_missing_response_key_returns_ok_false(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        envelope = json.dumps({"stats": {}})
+        proc = _make_completed_proc(stdout=envelope, returncode=0)
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIn("response", result.error.lower())
+
+    def test_inner_text_is_prose_returns_ok_false(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        envelope = json.dumps({"response": "I cannot classify this.", "stats": {}})
+        proc = _make_completed_proc(stdout=envelope, returncode=0)
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.data)
+
+    def test_generic_subprocess_exception_returns_ok_false(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        with patch("subprocess.run", side_effect=OSError("no such file")):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIsInstance(result, AnalysisResult)
+
+
+# ---------------------------------------------------------------------------
+# GeminiAdapter — argv shape (no shell=True)
+# ---------------------------------------------------------------------------
+
+class TestGeminiAdapterArgv(unittest.TestCase):
+
+    def test_argv_is_list_no_shell(self):
+        adapter = GeminiAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="my gemini prompt", model="gemini-2.5-flash")
+        inner = {"x": 1}
+        envelope = json.dumps({"response": json.dumps(inner), "stats": {}})
+        proc = _make_completed_proc(stdout=envelope)
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            adapter.run(req)
+        call_args, call_kwargs = mock_run.call_args
+        argv = call_args[0]
+        self.assertIsInstance(argv, list)
+        self.assertEqual(argv[0], "gemini")
+        self.assertIn("-p", argv)
+        self.assertIn("--model", argv)
+        self.assertIn("gemini-2.5-flash", argv)
+        self.assertIn("--output-format", argv)
+        self.assertIn("json", argv)
+        self.assertFalse(call_kwargs.get("shell", False))
+
+
+# ---------------------------------------------------------------------------
+# CodexAdapter — available() gate
+# ---------------------------------------------------------------------------
+
+class TestCodexAdapterAvailable(unittest.TestCase):
+
+    def test_true_when_which_finds_codex(self):
+        adapter = CodexAdapter()
+        with patch("shutil.which", return_value="/usr/local/bin/codex"):
+            self.assertTrue(adapter.available())
+
+    def test_false_when_which_returns_none(self):
+        adapter = CodexAdapter()
+        with patch("shutil.which", return_value=None):
+            self.assertFalse(adapter.available())
+
+    def test_cached_after_first_call(self):
+        adapter = CodexAdapter()
+        with patch("shutil.which", return_value="/usr/bin/codex") as mock_which:
+            adapter.available()
+            adapter.available()
+        mock_which.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# CodexAdapter — registered in _DEFAULT_REGISTRY
+# ---------------------------------------------------------------------------
+
+class TestCodexAdapterRegistered(unittest.TestCase):
+
+    def test_registered_in_default_registry(self):
+        from scripts.analysis_adapters import _DEFAULT_REGISTRY
+        self.assertIn("codex", _DEFAULT_REGISTRY)
+        self.assertIsInstance(_DEFAULT_REGISTRY["codex"], CodexAdapter)
+
+
+# ---------------------------------------------------------------------------
+# _extract_codex_agent_message — unit tests
+# ---------------------------------------------------------------------------
+
+class TestExtractCodexAgentMessage(unittest.TestCase):
+
+    def _make_jsonl(self, *events: dict) -> str:
+        return "\n".join(json.dumps(e) for e in events) + "\n"
+
+    def test_returns_last_agent_message_text(self):
+        jsonl = self._make_jsonl(
+            {"type": "thread.started", "thread_id": "uuid-1"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": '{"a":1}'}},
+            {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}},
+        )
+        self.assertEqual(_extract_codex_agent_message(jsonl), '{"a":1}')
+
+    def test_returns_last_of_multiple_agent_messages(self):
+        jsonl = self._make_jsonl(
+            {"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "first"}},
+            {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "last"}},
+        )
+        self.assertEqual(_extract_codex_agent_message(jsonl), "last")
+
+    def test_accepts_legacy_assistant_message_type(self):
+        """Pre-v0.44 schema used 'assistant_message' instead of 'agent_message'."""
+        jsonl = self._make_jsonl(
+            {"type": "item.completed", "item": {"id": "i0", "type": "assistant_message", "text": "legacy"}},
+        )
+        self.assertEqual(_extract_codex_agent_message(jsonl), "legacy")
+
+    def test_returns_none_when_no_agent_message(self):
+        jsonl = self._make_jsonl(
+            {"type": "thread.started", "thread_id": "uuid-1"},
+            {"type": "turn.completed", "usage": {}},
+        )
+        self.assertIsNone(_extract_codex_agent_message(jsonl))
+
+    def test_skips_invalid_json_lines(self):
+        text = 'not json\n{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"ok"}}\n'
+        self.assertEqual(_extract_codex_agent_message(text), "ok")
+
+    def test_returns_none_on_empty_string(self):
+        self.assertIsNone(_extract_codex_agent_message(""))
+
+
+# ---------------------------------------------------------------------------
+# CodexAdapter — run() happy path
+# ---------------------------------------------------------------------------
+
+class TestCodexAdapterRunSuccess(unittest.TestCase):
+
+    def _make_codex_jsonl(self, agent_text: str) -> str:
+        return "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "uuid-1"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": agent_text}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20}}),
+        ]) + "\n"
+
+    def _run_with_inner(self, inner_dict: dict, mode: str = "classify") -> AnalysisResult:
+        adapter = CodexAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode=mode, prompt="test prompt", model="gpt-4o")
+        stdout = self._make_codex_jsonl(json.dumps(inner_dict))
+        proc = _make_completed_proc(stdout=stdout)
+        with patch("subprocess.run", return_value=proc):
+            return adapter.run(req)
+
+    def test_ok_true_on_valid_inner_json(self):
+        result = self._run_with_inner({"category": "incident", "confidence": 0.9})
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.error)
+
+    def test_data_equals_parsed_inner_dict(self):
+        inner = {"category": "question", "confidence": 0.7}
+        result = self._run_with_inner(inner)
+        self.assertEqual(result.data, inner)
+
+    def test_provenance_starts_with_codex(self):
+        result = self._run_with_inner({"x": 1})
+        self.assertTrue(result.adapter.startswith("codex/"))
+
+    def test_mode_propagated(self):
+        result = self._run_with_inner({"x": 1}, mode="summarize")
+        self.assertEqual(result.mode, "summarize")
+
+
+# ---------------------------------------------------------------------------
+# CodexAdapter — run() failure modes
+# ---------------------------------------------------------------------------
+
+class TestCodexAdapterRunFailures(unittest.TestCase):
+
+    def _make_codex_jsonl(self, agent_text: str) -> str:
+        return json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": agent_text}}) + "\n"
+
+    def test_cli_not_found_returns_ok_false(self):
+        adapter = CodexAdapter()
+        req = AnalysisRequest(mode="classify", prompt="p")
+        with patch("shutil.which", return_value=None):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIn("not found", result.error.lower())
+
+    def test_timeout_returns_ok_false(self):
+        adapter = CodexAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p", timeout_seconds=5)
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="codex", timeout=5)):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIn("timeout", result.error.lower())
+
+    def test_timeout_does_not_raise(self):
+        adapter = CodexAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p", timeout_seconds=5)
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="codex", timeout=5)):
+            result = adapter.run(req)
+        self.assertIsInstance(result, AnalysisResult)
+
+    def test_nonzero_exit_returns_ok_false(self):
+        adapter = CodexAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        proc = _make_completed_proc(stdout="", returncode=1, stderr="error")
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+
+    def test_nonzero_exit_does_not_raise(self):
+        adapter = CodexAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        proc = _make_completed_proc(stdout="", returncode=2)
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertIsInstance(result, AnalysisResult)
+
+    def test_empty_stdout_returns_ok_false(self):
+        adapter = CodexAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        proc = _make_completed_proc(stdout="", returncode=0)
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIn("empty", result.error.lower())
+
+    def test_no_agent_message_in_jsonl_returns_ok_false(self):
+        adapter = CodexAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        stdout = json.dumps({"type": "thread.started", "thread_id": "x"}) + "\n"
+        proc = _make_completed_proc(stdout=stdout, returncode=0)
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIn("agent_message", result.error.lower())
+
+    def test_inner_text_is_prose_returns_ok_false(self):
+        adapter = CodexAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        stdout = self._make_codex_jsonl("I cannot provide a JSON response.")
+        proc = _make_completed_proc(stdout=stdout, returncode=0)
+        with patch("subprocess.run", return_value=proc):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.data)
+
+    def test_generic_subprocess_exception_returns_ok_false(self):
+        adapter = CodexAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p")
+        with patch("subprocess.run", side_effect=OSError("no such file")):
+            result = adapter.run(req)
+        self.assertFalse(result.ok)
+        self.assertIsInstance(result, AnalysisResult)
+
+
+# ---------------------------------------------------------------------------
+# CodexAdapter — argv shape (no shell=True)
+# ---------------------------------------------------------------------------
+
+class TestCodexAdapterArgv(unittest.TestCase):
+
+    def test_argv_is_list_no_shell(self):
+        adapter = CodexAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="my codex prompt", model="gpt-4o")
+        inner = {"x": 1}
+        stdout = json.dumps({
+            "type": "item.completed",
+            "item": {"id": "i0", "type": "agent_message", "text": json.dumps(inner)},
+        }) + "\n"
+        proc = _make_completed_proc(stdout=stdout)
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            adapter.run(req)
+        call_args, call_kwargs = mock_run.call_args
+        argv = call_args[0]
+        self.assertIsInstance(argv, list)
+        self.assertEqual(argv[0], "codex")
+        self.assertIn("exec", argv)
+        self.assertIn("--json", argv)
+        self.assertIn("--model", argv)
+        self.assertIn("gpt-4o", argv)
+        self.assertIn("my codex prompt", argv)
+        self.assertFalse(call_kwargs.get("shell", False))
+
+
+# ---------------------------------------------------------------------------
+# Config defaults — codex/gemini model defaults present, order unchanged
+# ---------------------------------------------------------------------------
+
+class TestConfigAdapterDefaults(unittest.TestCase):
+
+    def test_codex_model_default_present(self):
+        import sys
+        import tempfile
+        import os as _os
+        # Insert scripts/ path so config can import templates
+        scripts_dir = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from scripts.config import load_config
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = load_config(_os.path.join(tmpdir, "config.json"))
+        self.assertIn("codex", cfg["analyze"]["adapters"])
+        self.assertIn("model", cfg["analyze"]["adapters"]["codex"])
+
+    def test_gemini_model_default_present(self):
+        import sys
+        import tempfile
+        import os as _os
+        scripts_dir = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from scripts.config import load_config
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = load_config(_os.path.join(tmpdir, "config.json"))
+        self.assertIn("gemini", cfg["analyze"]["adapters"])
+        self.assertIn("model", cfg["analyze"]["adapters"]["gemini"])
+
+    def test_order_default_is_claude_only(self):
+        import sys
+        import tempfile
+        import os as _os
+        scripts_dir = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from scripts.config import load_config
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = load_config(_os.path.join(tmpdir, "config.json"))
+        self.assertEqual(cfg["analyze"]["adapters"]["order"], ["claude"])
+
+    def test_partial_config_still_has_codex_gemini_defaults(self):
+        """A config.json with only analyze.enabled=true is upgraded to include defaults."""
+        import sys
+        import tempfile
+        import os as _os
+        import json as _json
+        scripts_dir = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from scripts.config import load_config
+        with tempfile.TemporaryDirectory() as tmpdir:
+            partial = {"analyze": {"enabled": True}}
+            cfg_path = _os.path.join(tmpdir, "config.json")
+            with open(cfg_path, "w") as f:
+                _json.dump(partial, f)
+            cfg = load_config(cfg_path)
+        adapters = cfg["analyze"]["adapters"]
+        self.assertIn("codex", adapters)
+        self.assertIn("gemini", adapters)
+        self.assertEqual(adapters["order"], ["claude"])
+
+
+# ---------------------------------------------------------------------------
+# _short_model_name_gemini / _short_model_name_codex — unit tests
+# ---------------------------------------------------------------------------
+
+class TestShortModelNameGemini(unittest.TestCase):
+
+    def test_flash_extracted(self):
+        self.assertEqual(_short_model_name_gemini("gemini-2.5-flash"), "flash")
+
+    def test_pro_extracted(self):
+        self.assertEqual(_short_model_name_gemini("gemini-2.5-pro"), "pro")
+
+    def test_unknown_does_not_raise(self):
+        result = _short_model_name_gemini("some-model")
+        self.assertIsInstance(result, str)
+
+
+class TestShortModelNameCodex(unittest.TestCase):
+
+    def test_codex_extracted(self):
+        self.assertEqual(_short_model_name_codex("gpt-5.2-codex"), "codex")
+
+    def test_4o_extracted(self):
+        self.assertEqual(_short_model_name_codex("gpt-4o"), "4o")
+
+    def test_unknown_does_not_raise(self):
+        result = _short_model_name_codex("some-model")
+        self.assertIsInstance(result, str)
 
 
 if __name__ == "__main__":

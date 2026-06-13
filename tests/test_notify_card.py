@@ -109,15 +109,29 @@ def test_room_link_omitted_when_no_space():
 
 
 # --------------------------------------------------------------------------- #
-# Priority icon map.
+# Priority icon map — aligned to the AI taxonomy: high | normal | low | unset.
 # --------------------------------------------------------------------------- #
 def test_priority_icon_map():
-    assert notify._priority_icon(_item(priority="urgent")) == "🔴"
+    # Real taxonomy values.
     assert notify._priority_icon(_item(priority="high")) == "🔴"
-    assert notify._priority_icon(_item(priority="medium")) == "🟡"
     assert notify._priority_icon(_item(priority="normal")) == "🟢"
+    assert notify._priority_icon(_item(priority="low")) == "⚪"
+    # Neutral defaults — no crash, neutral icon.
     assert notify._priority_icon(_item(priority="unset")) == "⚪"
     assert notify._priority_icon(_item(priority=None)) == "⚪"
+    assert notify._priority_icon(_item(priority="")) == "⚪"
+
+
+def test_priority_icon_case_insensitive():
+    assert notify._priority_icon(_item(priority="HIGH")) == "🔴"
+    assert notify._priority_icon(_item(priority="Normal")) == "🟢"
+    assert notify._priority_icon(_item(priority="LOW")) == "⚪"
+
+
+def test_priority_icon_dead_keys_removed():
+    # "urgent" and "medium" were pre-taxonomy dead keys — now fall through to ⚪.
+    assert notify._priority_icon(_item(priority="urgent")) == "⚪"
+    assert notify._priority_icon(_item(priority="medium")) == "⚪"
 
 
 # --------------------------------------------------------------------------- #
@@ -419,3 +433,119 @@ def test_tg_html_escaping_unchanged_after_gchat_hardening():
     assert "&lt;a href=&quot;http://evil&quot;&gt;" in card
     assert "<b>&lt;b&gt;boss&lt;/b&gt;</b>" in card
     assert '<a href="https://chat.google.com/' in card
+
+
+# --------------------------------------------------------------------------- #
+# new_candidates — priority-based ordering.
+# --------------------------------------------------------------------------- #
+
+def _store_with_items(*items) -> dict:
+    """Build a minimal store_data dict from a list of item dicts."""
+    return {"items": {it["id"]: it for it in items}}
+
+
+def _new_item(iid: str, priority: str, cfg: dict | None = None) -> dict:
+    """Minimal store item that passes _is_new_candidate."""
+    return {
+        "id": iid,
+        "status": "new",
+        "last_notified": None,
+        "trigger": "user_mention",
+        "priority": priority,
+        "created_time": f"2026-06-04T10:00:0{iid[-1]}Z",
+    }
+
+
+def _minimal_cfg() -> dict:
+    """Minimal config that lets _is_new_candidate accept every 'new' item."""
+    return {
+        "baseline": {
+            "triggers": [],  # empty → accept all triggers via _matches_baseline
+        },
+    }
+
+
+def test_new_candidates_high_before_normal_before_low():
+    """high items appear first, then normal, then low — regardless of insertion order."""
+    # Insert in worst-case order: low, normal, high.
+    cfg = _minimal_cfg()
+    store = _store_with_items(
+        _new_item("a1", "low"),
+        _new_item("a2", "normal"),
+        _new_item("a3", "high"),
+    )
+    result = notify.new_candidates(store, cfg)
+    priorities = [it["priority"] for it in result]
+    # high must come before normal, normal before low.
+    assert priorities.index("high") < priorities.index("normal")
+    assert priorities.index("normal") < priorities.index("low")
+
+
+def test_new_candidates_unset_priority_after_low():
+    """Items with no/unset priority sort last (same bucket as low)."""
+    cfg = _minimal_cfg()
+    store = _store_with_items(
+        _new_item("b1", "unset"),
+        _new_item("b2", "high"),
+        _new_item("b3", ""),
+    )
+    result = notify.new_candidates(store, cfg)
+    ids = [it["id"] for it in result]
+    # high first, then unset/empty after it.
+    assert ids[0] == "b2"
+    assert set(ids[1:]) == {"b1", "b3"}
+
+
+def test_new_candidates_stable_tiebreak_within_priority():
+    """Items with equal priority keep their original insertion order."""
+    cfg = _minimal_cfg()
+    # Insert three 'normal' items; their iteration order is a1, a2, a3.
+    store = _store_with_items(
+        _new_item("a1", "normal"),
+        _new_item("a2", "normal"),
+        _new_item("a3", "normal"),
+    )
+    result = notify.new_candidates(store, cfg)
+    assert [it["id"] for it in result] == ["a1", "a2", "a3"]
+
+
+def test_new_candidates_mixed_stable_tiebreak():
+    """Stable sort: within each priority bucket, insertion order is preserved."""
+    cfg = _minimal_cfg()
+    store = _store_with_items(
+        _new_item("h1", "high"),
+        _new_item("n1", "normal"),
+        _new_item("h2", "high"),
+        _new_item("n2", "normal"),
+        _new_item("l1", "low"),
+    )
+    result = notify.new_candidates(store, cfg)
+    ids = [it["id"] for it in result]
+    # high items in insertion order, then normal in insertion order, then low.
+    assert ids == ["h1", "h2", "n1", "n2", "l1"]
+
+
+# --------------------------------------------------------------------------- #
+# SECURITY — context_summary stays escaped in all modes.
+# --------------------------------------------------------------------------- #
+def test_context_summary_escaped_tg_html():
+    """context_summary with HTML injection is always escaped in tg_html mode."""
+    evil = _item(context_summary="<script>alert(1)</script>")
+    card = notify.render_card([evil], [], now=NOW, mode="tg_html")
+    assert "<script>" not in card
+    assert "&lt;script&gt;" in card
+
+
+def test_context_summary_escaped_gchat():
+    """context_summary with Chat-markup injection is defanged in gchat mode."""
+    evil = _item(context_summary="<https://evil.example|pwn> <users/all>")
+    card = notify.render_card([evil], [], now=NOW, mode="gchat")
+    assert "<https://evil.example|" not in card
+    assert "<users/all>" not in card
+
+
+def test_context_summary_passthrough_plain():
+    """In plain mode, context_summary is not HTML-escaped (no markup expected)."""
+    it = _item(context_summary="a & b < c > d")
+    card = notify.render_card([it], [], now=NOW, mode="plain")
+    assert "a & b < c > d" in card

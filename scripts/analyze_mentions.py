@@ -71,6 +71,8 @@ from analysis_adapters import (  # noqa: E402
     AnalysisRequest,
     AnalysisResult,
     ClaudeAdapter,
+    CodexAdapter,
+    GeminiAdapter,
 )
 from analysis_prompts import build_classify_prompt, build_summarize_prompt  # noqa: E402
 
@@ -200,8 +202,18 @@ def _make_logger(base_dir: Path, now_dt: datetime):
 # Adapter router
 # --------------------------------------------------------------------------- #
 def _build_adapter_registry() -> dict:
-    """Return the built-in adapter registry (one instance per known name)."""
-    return {"claude": ClaudeAdapter()}
+    """Return the built-in adapter registry (one instance per known name).
+
+    All known adapters are registered so an operator can opt into fallback via
+    ``analyze.adapters.order`` (e.g. ``["claude", "codex", "gemini"]``); each
+    adapter's ``available()`` gates whether its CLI is actually present. The
+    default order is ``["claude"]``, so codex/gemini stay dormant until enabled.
+    """
+    return {
+        "claude": ClaudeAdapter(),
+        "codex": CodexAdapter(),
+        "gemini": GeminiAdapter(),
+    }
 
 
 def _select_adapter(cfg: dict, registry: Optional[dict] = None) -> Optional[AnalysisAdapter]:
@@ -934,6 +946,15 @@ def _parse_args(argv=None):
         help="override max_items_per_run for this run",
     )
     p.add_argument("--verbose", action="store_true", help="print structured log lines to stdout")
+    p.add_argument(
+        "--cron",
+        action="store_true",
+        help=(
+            "invoked by triage_cron.sh; self-skip (exit 0) when "
+            "analyze.run_in_cron is False in config, so the cron chain "
+            "always proceeds to notify.py regardless"
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -947,6 +968,15 @@ def main(argv=None) -> int:
     #     pipeline is completely silent. --------------------------------------- #
     cfg = config.load_config(args.config_path)
     analyze_cfg = cfg.get("analyze", {})
+
+    # --- CRON GATE: when invoked by triage_cron.sh (--cron flag), skip silently
+    #     unless analyze.run_in_cron is explicitly True.  This ensures notify.py
+    #     always runs on the cron chain even when LLM analysis is not opted in.
+    if args.cron and not analyze_cfg.get("run_in_cron", False):
+        log("skip", reason="run_in_cron-disabled")
+        if args.verbose:
+            print("analyze.run_in_cron is False; skipping (cron mode)")
+        return 0
     if not analyze_cfg.get("enabled", False):
         log("skip", reason="analyze-disabled")
         if args.verbose:

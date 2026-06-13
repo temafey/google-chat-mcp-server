@@ -256,12 +256,24 @@ def _is_new_candidate(item: dict, cfg: dict) -> bool:
     )
 
 
+_PRIORITY_ORDER = {"high": 0, "normal": 1, "low": 2}
+
+
 def new_candidates(store_data: dict, cfg: dict) -> list:
-    return [
+    """Return new-notify candidates sorted by priority (high first, then normal, then low/unset).
+
+    Items with equal priority keep their original iteration order (stable tiebreak on
+    dict insertion order, which tracks creation/detection time).
+    """
+    items = [
         it
         for it in store_data.get("items", {}).values()
         if _is_new_candidate(it, cfg)
     ]
+    return sorted(
+        items,
+        key=lambda it: _PRIORITY_ORDER.get((it.get("priority") or "").lower(), 2),
+    )
 
 
 def escalation_candidates(store_data: dict, now: datetime) -> list:
@@ -492,12 +504,13 @@ _INDENT = "   "
 # this default keeps direct ``_link_line`` callers (and tests) unaffected.
 _LINK_LABEL = "🔗 Open in Chat"
 
-# Priority → icon. urgent/high → 🔴, medium → 🟡, normal → 🟢, else ⚪.
+# Priority → icon. Taxonomy: high | normal | low | unset.
+# high → 🔴, normal → 🟢, low/unset/unknown → ⚪.
+# "urgent" and "medium" were pre-taxonomy dead keys — removed.
 _PRIORITY_ICON = {
-    "urgent": "🔴",
     "high": "🔴",
-    "medium": "🟡",
     "normal": "🟢",
+    "low": "⚪",
 }
 
 

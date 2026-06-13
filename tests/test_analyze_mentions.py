@@ -247,6 +247,43 @@ class TestAdapterSelection:
         adapter = am._select_adapter(cfg)
         assert adapter is None
 
+    def test_builtin_registry_has_all_adapters(self):
+        """D3 wiring: the built-in registry exposes claude, codex, gemini so an
+        operator can opt into fallback via analyze.adapters.order."""
+        reg = am._build_adapter_registry()
+        assert set(reg) == {"claude", "codex", "gemini"}
+        assert reg["codex"].name == "codex"
+        assert reg["gemini"].name == "gemini"
+
+    def test_order_selects_codex_over_claude_when_available(self):
+        """When order lists codex first and codex is available, it wins — proving
+        the order-based fallback actually reaches the non-claude adapters."""
+        cfg = _make_config()
+        cfg["analyze"]["adapters"]["order"] = ["codex", "claude"]
+        codex = FakeAdapter(is_available=True)
+        codex.name = "codex"
+        claude = FakeAdapter(is_available=True)
+        claude.name = "claude"
+        registry = {"claude": claude, "codex": codex}
+
+        adapter = am._select_adapter(cfg, registry=registry)
+        assert adapter is codex
+
+    def test_order_falls_through_to_gemini_when_others_unavailable(self):
+        """Fallback skips unavailable adapters and reaches gemini."""
+        cfg = _make_config()
+        cfg["analyze"]["adapters"]["order"] = ["claude", "codex", "gemini"]
+        gemini = FakeAdapter(is_available=True)
+        gemini.name = "gemini"
+        registry = {
+            "claude": FakeAdapter(is_available=False),
+            "codex": FakeAdapter(is_available=False),
+            "gemini": gemini,
+        }
+
+        adapter = am._select_adapter(cfg, registry=registry)
+        assert adapter is gemini
+
     def test_run_analysis_no_adapter_from_router(self):
         """When _select_adapter returns None (no adapter= kwarg), result is ok no-op."""
         cfg = _make_config()
@@ -1415,3 +1452,117 @@ class TestTier2Tier1Unchanged:
         assert result["stored"] == 1
         assert result["deferred"] == 0
         assert result["escalated"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# --cron gate tests (D1)
+# --------------------------------------------------------------------------- #
+
+def _write_config_file(path: Path, cfg_override: dict) -> None:
+    """Write a minimal config.json to *path* merging cfg_override into defaults."""
+    import copy
+    merged = copy.deepcopy(config.DEFAULT_CONFIG)
+    # Deep-merge analyze overrides
+    for k, v in cfg_override.get("analyze", {}).items():
+        merged["analyze"][k] = v
+    merged.update({k: v for k, v in cfg_override.items() if k != "analyze"})
+    path.write_text(json.dumps(merged), encoding="utf-8")
+
+
+class TestCronGate:
+    """Tests for the --cron flag gating added in D1.
+
+    Coverage:
+      (a) --cron + run_in_cron=False  → returns 0, run_analysis NOT called.
+      (b) --cron + run_in_cron=True + enabled=True  → run_analysis IS called.
+      (c) no --cron flag              → run_in_cron is ignored (unchanged behavior).
+    """
+
+    def test_cron_flag_skips_when_run_in_cron_false(self, tmp_path, monkeypatch):
+        """(a) --cron + run_in_cron=False → exit 0, run_analysis never invoked."""
+        cfg_path = tmp_path / "config.json"
+        store_path = tmp_path / "store.json"
+        # Write a config with analyze.enabled=True but run_in_cron=False (the default)
+        _write_config_file(cfg_path, {"analyze": {"enabled": True, "run_in_cron": False}})
+        # Pre-populate a store so there would be items to analyze if we DID run
+        s = _make_store([_item()])
+        import store as store_mod
+        store_mod.save(s, store_path)
+
+        run_analysis_calls = []
+
+        def spy_run_analysis(*args, **kwargs):
+            run_analysis_calls.append((args, kwargs))
+            return {"status": "ok", "selected": 0, "stored": 0, "deferred": 0,
+                    "failed": 0, "skipped": 0, "escalated": 0, "thread_failed": 0}
+
+        monkeypatch.setattr(am, "run_analysis", spy_run_analysis)
+
+        rc = am.main([
+            "--cron",
+            "--config-path", str(cfg_path),
+            "--store-path", str(store_path),
+            "--base-dir", str(tmp_path),
+        ])
+
+        assert rc == 0
+        assert run_analysis_calls == [], "run_analysis must NOT be called when run_in_cron=False"
+
+    def test_cron_flag_runs_when_run_in_cron_true(self, tmp_path, monkeypatch):
+        """(b) --cron + run_in_cron=True + enabled=True → run_analysis IS invoked."""
+        cfg_path = tmp_path / "config.json"
+        store_path = tmp_path / "store.json"
+        _write_config_file(cfg_path, {"analyze": {"enabled": True, "run_in_cron": True}})
+        s = _make_store([_item()])
+        import store as store_mod
+        store_mod.save(s, store_path)
+
+        run_analysis_calls = []
+
+        def spy_run_analysis(*args, **kwargs):
+            run_analysis_calls.append((args, kwargs))
+            return {"status": "ok", "selected": 0, "stored": 0, "deferred": 0,
+                    "failed": 0, "skipped": 0, "escalated": 0, "thread_failed": 0}
+
+        monkeypatch.setattr(am, "run_analysis", spy_run_analysis)
+
+        rc = am.main([
+            "--cron",
+            "--config-path", str(cfg_path),
+            "--store-path", str(store_path),
+            "--base-dir", str(tmp_path),
+        ])
+
+        assert rc == 0
+        assert len(run_analysis_calls) == 1, "run_analysis must be called when run_in_cron=True"
+
+    def test_no_cron_flag_ignores_run_in_cron(self, tmp_path, monkeypatch):
+        """(c) Without --cron, run_in_cron is irrelevant — enabled gate is what matters."""
+        cfg_path = tmp_path / "config.json"
+        store_path = tmp_path / "store.json"
+        # run_in_cron=False but no --cron flag: should still proceed to run_analysis
+        # because --cron gate is only checked when args.cron is True.
+        _write_config_file(cfg_path, {"analyze": {"enabled": True, "run_in_cron": False}})
+        s = _make_store([_item()])
+        import store as store_mod
+        store_mod.save(s, store_path)
+
+        run_analysis_calls = []
+
+        def spy_run_analysis(*args, **kwargs):
+            run_analysis_calls.append((args, kwargs))
+            return {"status": "ok", "selected": 0, "stored": 0, "deferred": 0,
+                    "failed": 0, "skipped": 0, "escalated": 0, "thread_failed": 0}
+
+        monkeypatch.setattr(am, "run_analysis", spy_run_analysis)
+
+        rc = am.main([
+            "--config-path", str(cfg_path),
+            "--store-path", str(store_path),
+            "--base-dir", str(tmp_path),
+        ])
+
+        assert rc == 0
+        assert len(run_analysis_calls) == 1, (
+            "Without --cron, run_in_cron must be ignored; run_analysis must proceed"
+        )

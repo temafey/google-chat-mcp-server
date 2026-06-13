@@ -2,23 +2,41 @@
 #
 # triage_cron.sh — cron wrapper for the Google Chat Triage Assistant (T2.3).
 #
-# Runs the read-only collector THEN the notifier, chained so notify is skipped
-# if collect fails. cron hands us a MINIMAL environment (no PATH, no venv, no
-# PYTHONPATH), so this wrapper reconstructs everything the Python scripts need.
+# Pipeline: collect → analyze → notify (all three chained with &&).
 #
-# It adds ZERO new Chat-write calls of its own — the only outward write is
-# notify.py's GCInboxSender, gated by config. The collector is strictly
-# read-only. Both scripts hold their own run/token locks; overlap protection at
-# the cron level is provided by the flock(1) in the installed crontab line.
+#   collect_mentions.py   — read-only; fetches new @mentions from Chat API and
+#                           writes them to the local triage store.
+#   analyze_mentions.py   — opt-in AI stage; gated by config key
+#                           analyze.run_in_cron (default: False).  Invoked with
+#                           --cron so it self-skips (exit 0) when that flag is
+#                           False, ensuring notify always runs.  When enabled,
+#                           it calls an LLM CLI (claude / codex / gemini) as a
+#                           subprocess — those CLIs must be authenticated in the
+#                           cron environment.  analyze writes ONLY the local
+#                           triage store; Tier-2 thread reads are read-only
+#                           messages.list calls; it performs NO Chat writes.
+#   notify.py             — sends digest / inbox messages; the only step that
+#                           writes to Google Chat, and only when gated by config.
+#
+# NOTE: with &&-chaining a catastrophic analyze exit≠0 (rare; soft failures are
+# counted and returned as exit 0) would skip notify for that cycle.  This is
+# intentional: it signals something badly wrong; the next cron tick recovers.
+#
+# cron hands us a MINIMAL environment (no PATH, no venv, no PYTHONPATH), so
+# this wrapper reconstructs everything the Python scripts need.
+#
+# Overlap protection at the cron level is provided by the flock(1) in the
+# installed crontab line.
 #
 # Usage:
-#   triage_cron.sh           # one collect+notify cycle, output appended to a
-#                            # dated log file (the cron path).
+#   triage_cron.sh           # one collect+analyze+notify cycle, output appended
+#                            # to a dated log file (the cron path).
 #   triage_cron.sh --once    # same sequence once, output ALSO to stdout
 #                            # (smoke test).
 #
 # Exit status: non-zero if the collector fails (so the outer flock/cron records
-# the failure). If collect succeeds but notify fails, the exit reflects notify.
+# the failure). If collect succeeds but a later step fails, the exit reflects
+# that step.
 set -euo pipefail
 
 # --- Fixed location of the checkout (cron has no notion of cwd) ------------- #
@@ -46,11 +64,15 @@ if [[ "${1:-}" == "--once" ]]; then
   ONCE=1
 fi
 
-# Run collect THEN notify, chained with && so notify is skipped on collect
-# failure. We must capture the chain's exit status WITHOUT `set -e` aborting the
-# script mid-pipeline, so the body runs in a function whose status we inspect.
+# Run collect → analyze → notify, chained with && so each step is skipped if
+# the prior one fails.  We must capture the chain's exit status WITHOUT `set -e`
+# aborting the script mid-pipeline, so the body runs in a function whose status
+# we inspect.  analyze is passed --cron so it self-skips (exit 0) when
+# analyze.run_in_cron is False — Python owns all config gating, no JSON parsing
+# in bash.
 run_cycle() {
   uv run python scripts/collect_mentions.py \
+    && uv run python scripts/analyze_mentions.py --cron \
     && uv run python scripts/notify.py
 }
 

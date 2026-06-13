@@ -145,10 +145,27 @@ def test_empty_when_never_matches():
 
 
 def test_default_variant_routes_high_priority_to_detailed():
-    # The shipped example variant: urgent/high → detailed (bigger tg expand).
+    # The shipped variant: high → detailed (bigger tg expand).
     long = _item(priority="high", context_summary="sum", text="Z" * 500)
     card = notify.render_card([long], [], now=NOW, mode="tg_html", templates_cfg=_tcfg())
     assert card.count("Z") > 280  # detailed cap applied via the variant
+
+
+def test_default_variant_no_urgent_key():
+    # "urgent" is not in the AI taxonomy — the default variants list must NOT reference it.
+    import json
+    variants = templates.DEFAULT_TEMPLATES.get("variants", [])
+    serialized = json.dumps(variants)
+    assert "urgent" not in serialized, (
+        "Dead key 'urgent' found in DEFAULT_TEMPLATES variants — remove it."
+    )
+
+
+def test_default_variant_normal_priority_not_detailed():
+    # normal priority must NOT trigger the high→detailed variant.
+    normal = _item(priority="normal", context_summary="sum", text="Z" * 500)
+    card = notify.render_card([normal], [], now=NOW, mode="tg_html", templates_cfg=_tcfg())
+    assert card.count("Z") <= 280  # default profile cap 280, not detailed 700
 
 
 def test_pinned_item_renders_pin_icon_override():
