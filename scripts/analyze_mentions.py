@@ -74,7 +74,11 @@ from analysis_adapters import (  # noqa: E402
     CodexAdapter,
     GeminiAdapter,
 )
-from analysis_prompts import build_classify_prompt, build_summarize_prompt  # noqa: E402
+from analysis_prompts import (  # noqa: E402
+    build_classify_prompt,
+    build_reply_suggestions_prompt,
+    build_summarize_prompt,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -310,6 +314,7 @@ def build_ctx(item: dict, cfg: dict) -> dict:
         "trigger": item.get("trigger") or "",
         "text": item.get("text") or "",
         "quoted": extract_quoted_text(item),
+        "summary_language": (cfg.get("analyze") or {}).get("summary_language") or "",
     }
 
 
@@ -624,6 +629,7 @@ def _build_thread_ctx(
         "space_display": space_display,
         "space_type": space_type,
         "thread": thread_rows,
+        "summary_language": (cfg.get("analyze") or {}).get("summary_language") or "",
     }
     if target_index is not None:
         ctx["target_index"] = target_index
@@ -809,6 +815,277 @@ def run_tier2(
 
 
 # --------------------------------------------------------------------------- #
+# Tier-3: reply nudge (detect-no-reply → generate ready-to-send drafts)
+# --------------------------------------------------------------------------- #
+def _nudge_threshold_minutes(priority: str, nudge_cfg: dict) -> Optional[int]:
+    """Minutes to wait before nudging this priority, or None if never nudged."""
+    thresholds = nudge_cfg.get("thresholds_minutes") or {}
+    val = thresholds.get((priority or "").lower())
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def select_nudge_items(store_obj: dict, cfg: dict, now: datetime) -> list:
+    """Items eligible for a reply nudge.
+
+    Predicate (all must hold):
+      - status is OPEN (still actionable),
+      - ``last_notified`` is set (I was already told about it),
+      - not ``response_posted`` (no reply detected yet),
+      - ``reply_nudged_at`` is None (one nudge per item),
+      - the item's priority has a configured threshold (low → never), and
+      - ``now - last_notified >= threshold(priority)``.
+
+    Sorted high-priority first, oldest-notified first; capped at ``check_limit``.
+    """
+    nudge_cfg = (cfg.get("analyze") or {}).get("reply_nudge") or {}
+    open_statuses = set(getattr(store, "OPEN_STATUSES", ()))
+    out = []
+    for item in store_obj.get("items", {}).values():
+        if open_statuses and item.get("status") not in open_statuses:
+            continue
+        if item.get("response_posted"):
+            continue
+        if item.get("reply_nudged_at"):
+            continue
+        last_notified = item.get("last_notified")
+        if not last_notified:
+            continue
+        minutes = _nudge_threshold_minutes(item.get("priority"), nudge_cfg)
+        if minutes is None:
+            continue
+        notified_dt = _parse_store_iso(last_notified)
+        if notified_dt is None:
+            continue
+        if (now - notified_dt).total_seconds() < minutes * 60:
+            continue
+        out.append(item)
+
+    out.sort(key=lambda it: (
+        {"high": 0, "normal": 1, "low": 2}.get((it.get("priority") or "").lower(), 3),
+        _parse_store_iso(it.get("last_notified")) or now,
+    ))
+    try:
+        cap = int(nudge_cfg.get("check_limit") or 25)
+    except (TypeError, ValueError):
+        cap = 25
+    return out[:cap]
+
+
+def _parse_store_iso(value) -> Optional[datetime]:
+    """Parse an ISO timestamp from the store into a tz-aware UTC datetime."""
+    if not value:
+        return None
+    try:
+        s = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def detect_my_reply(item: dict, me_id: str, creds, *, fetch_fn=None) -> Optional[bool]:
+    """READ-ONLY: did *me_id* post in this item's thread/space after the message?
+
+    Prefers the item's thread (precise "did I answer this conversation"); falls
+    back to the whole space for DMs without a thread_name. Returns:
+      True  — a message from me_id newer than the item exists,
+      False — none found,
+      None  — could not determine (no ids / fetch error) → caller skips safely.
+
+    Never writes to Chat. Bare numeric ids are compared so "users/123" matches.
+    """
+    if not me_id:
+        return None
+    space_name = item.get("space_name") or ""
+    if not space_name:
+        return None
+    me_bare = str(me_id).split("/")[-1]
+    created = item.get("created_time")
+
+    import google_chat as gchat  # noqa: PLC0415
+    fetch_thread = fetch_fn or gchat._list_thread_messages_sync
+    thread_name = item.get("thread_name") or ""
+
+    try:
+        if thread_name:
+            messages = fetch_thread(creds, space_name, thread_name, max_messages=50)
+        else:
+            messages = gchat._list_messages_sync(creds, space_name, created, None)
+    except Exception:  # noqa: BLE001 - read failure → undetermined, never raise
+        return None
+
+    created_dt = _parse_store_iso(created)
+    for msg in messages or []:
+        sender = (msg.get("sender") or {}).get("name") or ""
+        if str(sender).split("/")[-1] != me_bare:
+            continue
+        # In thread mode we still bound by the original message time so an older
+        # message of mine in the same thread does not count as a reply.
+        mt = _parse_store_iso(msg.get("createTime") or msg.get("created_time"))
+        if created_dt is not None and mt is not None and mt <= created_dt:
+            continue
+        return True
+    return False
+
+
+def _validate_suggestions(data: dict, *, max_n: int) -> Optional[list]:
+    """Return a cleaned list of 1..max_n non-empty reply strings, or None."""
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("suggestions")
+    if not isinstance(raw, list):
+        return None
+    out = []
+    for s in raw:
+        if isinstance(s, str) and s.strip():
+            out.append(s.strip())
+    return out[:max_n] if out else None
+
+
+def generate_reply_suggestions(
+    item: dict, cfg: dict, adapter: AnalysisAdapter
+) -> Optional[list]:
+    """Call the LLM adapter to draft reply options. Returns a cleaned list or None.
+
+    UNTRUSTED message text is sanitized inside ``build_reply_suggestions_prompt``;
+    the returned drafts are themselves UNTRUSTED and MUST be escaped at render."""
+    analyze_cfg = cfg.get("analyze") or {}
+    nudge_cfg = analyze_cfg.get("reply_nudge") or {}
+    model = (analyze_cfg.get("adapters", {}).get("claude", {})
+             .get("model", "claude-haiku-4-5-20251001"))
+    timeout = analyze_cfg.get("timeout_seconds", 60)
+    max_n = int(nudge_cfg.get("max_suggestions") or 3)
+
+    ctx = {
+        "me_name": cfg.get("me_display_name") or "",
+        "me_role": cfg.get("me_role") or "engineering lead",
+        "sender_name": item.get("sender_name") or "",
+        "sender_role": item.get("sender_role") or "",
+        "space_display": item.get("space_display") or "",
+        "space_type": item.get("space_type") or "",
+        "summary": item.get("context_summary") or "",
+        "text": item.get("text") or "",
+        "min_suggestions": nudge_cfg.get("min_suggestions") or 2,
+        "max_suggestions": max_n,
+        "reply_language": nudge_cfg.get("reply_language") or "",
+    }
+    req = AnalysisRequest(
+        mode="classify",  # single-shot JSON call; reuses the classify adapter path
+        prompt=build_reply_suggestions_prompt(ctx),
+        model=model,
+        timeout_seconds=timeout,
+    )
+    res: AnalysisResult = adapter.run(req)
+    if not res.ok:
+        return None
+    return _validate_suggestions(res.data or {}, max_n=max_n)
+
+
+def run_reply_nudge(
+    store_obj: dict,
+    cfg: dict,
+    now: datetime,
+    *,
+    adapter: Optional[AnalysisAdapter] = None,
+    me_id: Optional[str] = None,
+    reply_fetch_fn=None,
+    dry_run: bool = False,
+    limit: Optional[int] = None,
+    log=None,
+) -> dict:
+    """Run one Tier-3 reply-nudge pass.
+
+    For each eligible item: detect whether I already replied (READ-ONLY). If so,
+    record it (``response_posted``/``answered_at``) and skip. Otherwise generate
+    reply drafts and stash them on the item so the notify stage can send the
+    nudge. NEVER writes to Chat; NEVER changes lifecycle status.
+
+    Returns stats: ``{checked, replied, suggested, failed}``.
+    """
+    def _log(event, **kw):
+        if log:
+            log(event, **kw)
+
+    analyze_cfg = cfg.get("analyze") or {}
+    nudge_cfg = analyze_cfg.get("reply_nudge") or {}
+    if not nudge_cfg.get("enabled", False):
+        return {"checked": 0, "replied": 0, "suggested": 0, "failed": 0}
+
+    items = select_nudge_items(store_obj, cfg, now)
+    if limit is not None:
+        items = items[:limit]
+    if not items:
+        return {"checked": 0, "replied": 0, "suggested": 0, "failed": 0}
+
+    if adapter is None:
+        adapter = _select_adapter(cfg)
+    if adapter is None:
+        _log("nudge-skip", reason="no-adapter-available")
+        return {"checked": 0, "replied": 0, "suggested": 0, "failed": 0}
+
+    import google_chat as gchat  # noqa: PLC0415
+    creds = gchat.get_credentials()
+    if creds is None:
+        _log("nudge-skip", reason="no-credentials")
+        return {"checked": 0, "replied": 0, "suggested": 0, "failed": 0}
+
+    if not me_id:
+        me_id = cfg.get("me_user_id") or ""
+        if not me_id:
+            try:
+                me_id = gchat._resolve_me_sync(creds)
+            except Exception:  # noqa: BLE001
+                me_id = ""
+    if not me_id:
+        _log("nudge-skip", reason="no-me-id")
+        return {"checked": 0, "replied": 0, "suggested": 0, "failed": 0}
+
+    now_iso = _iso_z(now)
+    checked = replied = suggested = failed = 0
+
+    for item in items:
+        checked += 1
+        replied_now = detect_my_reply(item, me_id, creds, fetch_fn=reply_fetch_fn)
+        if replied_now:
+            replied += 1
+            if dry_run:
+                print(f"[dry-run] NUDGE item={item.get('id')} → already replied")
+            else:
+                store.set_fields(
+                    store_obj, item["id"],
+                    response_posted=True, answered_at=now_iso, reply_checked_at=now_iso,
+                )
+            _log("nudge-replied", item_id=item.get("id"))
+            continue
+
+        drafts = generate_reply_suggestions(item, cfg, adapter)
+        if not drafts:
+            failed += 1
+            _log("nudge-failed", item_id=item.get("id"))
+            continue
+
+        suggested += 1
+        if dry_run:
+            print(f"[dry-run] NUDGE item={item.get('id')} → {len(drafts)} drafts")
+        else:
+            store.set_fields(
+                store_obj, item["id"],
+                reply_suggestions=drafts, reply_checked_at=now_iso,
+            )
+        _log("nudge-suggested", item_id=item.get("id"), n=len(drafts))
+
+    _log("nudge-run", checked=checked, replied=replied, suggested=suggested, failed=failed)
+    return {"checked": checked, "replied": replied, "suggested": suggested, "failed": failed}
+
+
+# --------------------------------------------------------------------------- #
 # Core orchestrator
 # --------------------------------------------------------------------------- #
 def run_analysis(
@@ -821,6 +1098,7 @@ def run_analysis(
     limit: Optional[int] = None,
     log=None,
     store_path=None,
+    cron: bool = False,
 ) -> dict:
     """Run one analysis pass.  Assumes the run-lock is already held by caller.
 
@@ -898,6 +1176,21 @@ def run_analysis(
         escalated = tier2_stats.get("escalated", 0)
         thread_failed = tier2_stats.get("thread_failed", 0)
 
+    # --- TIER-3: reply nudge ---------------------------------------------- #
+    # Gate: reply_nudge.enabled (master) AND, in cron context, run_in_cron.
+    # Detection is READ-ONLY; drafts are stored for the notify stage to send.
+    nudge_stats = {"checked": 0, "replied": 0, "suggested": 0, "failed": 0}
+    nudge_cfg = analyze_cfg.get("reply_nudge") or {}
+    if nudge_cfg.get("enabled", False) and (not cron or nudge_cfg.get("run_in_cron", False)):
+        nudge_stats = run_reply_nudge(
+            store_obj,
+            cfg,
+            now,
+            adapter=adapter,
+            dry_run=dry_run,
+            log=log,
+        )
+
     # --- PERSIST (atomic, once) ------------------------------------------- #
     if not dry_run:
         store.save(store_obj, store_path)
@@ -911,6 +1204,8 @@ def run_analysis(
         failed=failed,
         escalated=escalated,
         thread_failed=thread_failed,
+        nudge_suggested=nudge_stats["suggested"],
+        nudge_replied=nudge_stats["replied"],
     )
     return {
         "status": "ok",
@@ -921,6 +1216,10 @@ def run_analysis(
         "skipped": 0,
         "escalated": escalated,
         "thread_failed": thread_failed,
+        "nudge_checked": nudge_stats["checked"],
+        "nudge_replied": nudge_stats["replied"],
+        "nudge_suggested": nudge_stats["suggested"],
+        "nudge_failed": nudge_stats["failed"],
     }
 
 
@@ -1006,6 +1305,7 @@ def main(argv=None) -> int:
             limit=args.limit,
             log=log,
             store_path=args.store_path,
+            cron=args.cron,
         )
     finally:
         _release_lock(run_lock)
@@ -1020,7 +1320,9 @@ def main(argv=None) -> int:
         f"deferred={result['deferred']} "
         f"failed={result['failed']} "
         f"escalated={result.get('escalated', 0)} "
-        f"thread_failed={result.get('thread_failed', 0)}"
+        f"thread_failed={result.get('thread_failed', 0)} "
+        f"nudge_suggested={result.get('nudge_suggested', 0)} "
+        f"nudge_replied={result.get('nudge_replied', 0)}"
     )
     return 0
 

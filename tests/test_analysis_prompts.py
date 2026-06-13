@@ -19,6 +19,7 @@ from scripts.analysis_prompts import (
     build_summarize_prompt,
     _sanitize,
     _addressing,
+    _lang_line,
 )
 
 # ---------------------------------------------------------------------------
@@ -493,3 +494,74 @@ class TestSummarizeInjectionGuard:
         # The raw uppercase </THREAD> must be neutralized
         assert "< /thread>" in prompt.lower() or "< /THREAD>" in prompt
         assert prompt.count("</thread>") == 1
+
+
+# ---------------------------------------------------------------------------
+# summary_language — configurable output language for summary/priority_reason
+# ---------------------------------------------------------------------------
+
+class TestLangLine:
+    def test_empty_is_blank(self):
+        assert _lang_line("") == ""
+        assert _lang_line(None) == ""
+
+    def test_known_code_names_language(self):
+        line = _lang_line("uk")
+        assert "in Ukrainian" in line
+        assert line.endswith("\n")
+        # Keys/enums must stay English so downstream parsing is unaffected.
+        assert "keep all JSON keys and enum values in English" in line
+
+    def test_ru_code(self):
+        assert "in Russian" in _lang_line("ru")
+
+    def test_source_mirrors_message_language(self):
+        for code in ("source", "auto", "same"):
+            line = _lang_line(code)
+            assert "same language as the chat content" in line
+
+    def test_unknown_code_passthrough_uppercased(self):
+        # An unrecognized code is still inert (appended to a trusted template).
+        assert "in XX" in _lang_line("xx")
+
+    def test_case_and_whitespace_insensitive(self):
+        assert _lang_line("  UK  ") == _lang_line("uk")
+
+
+class TestSummaryLanguageInPrompts:
+    def test_classify_injects_language(self):
+        prompt = build_classify_prompt(_make_ctx(summary_language="uk"))
+        assert "in Ukrainian" in prompt
+        # Still a well-formed prompt ending in the JSON ask.
+        assert "Return ONLY this JSON" in prompt
+
+    def test_classify_default_omits_language_line(self):
+        prompt = build_classify_prompt(_make_ctx())  # no summary_language
+        assert "Write the \"summary\"" not in prompt
+
+    def test_classify_with_quoted_injects_language(self):
+        prompt = build_classify_prompt(
+            _make_ctx(quoted="some quoted text", summary_language="ru")
+        )
+        assert "in Russian" in prompt
+        assert "<quoted>" in prompt
+
+    def test_summarize_injects_language(self):
+        ctx = {
+            "me_name": "Alice", "me_role": "Lead",
+            "space_display": "Chan", "space_type": "SPACE",
+            "thread": [{"t": "T1", "sender": "X", "text": "hi", "is_target": True}],
+            "summary_language": "uk",
+        }
+        prompt = build_summarize_prompt(ctx)
+        assert "in Ukrainian" in prompt
+        assert "Return ONLY this JSON" in prompt
+
+    def test_summarize_default_omits_language_line(self):
+        ctx = {
+            "me_name": "Alice", "me_role": "Lead",
+            "space_display": "Chan", "space_type": "SPACE",
+            "thread": [{"t": "T1", "sender": "X", "text": "hi", "is_target": True}],
+        }
+        prompt = build_summarize_prompt(ctx)
+        assert "Write the \"summary\"" not in prompt

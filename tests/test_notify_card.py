@@ -112,26 +112,26 @@ def test_room_link_omitted_when_no_space():
 # Priority icon map — aligned to the AI taxonomy: high | normal | low | unset.
 # --------------------------------------------------------------------------- #
 def test_priority_icon_map():
-    # Real taxonomy values.
-    assert notify._priority_icon(_item(priority="high")) == "🔴"
-    assert notify._priority_icon(_item(priority="normal")) == "🟢"
-    assert notify._priority_icon(_item(priority="low")) == "⚪"
-    # Neutral defaults — no crash, neutral icon.
-    assert notify._priority_icon(_item(priority="unset")) == "⚪"
-    assert notify._priority_icon(_item(priority=None)) == "⚪"
-    assert notify._priority_icon(_item(priority="")) == "⚪"
+    # Real taxonomy values: high → 🔥, normal → 🟡, low/unset → 🟢.
+    assert notify._priority_icon(_item(priority="high")) == "🔥"
+    assert notify._priority_icon(_item(priority="normal")) == "🟡"
+    assert notify._priority_icon(_item(priority="low")) == "🟢"
+    # Neutral defaults — no crash; low and "no priority yet" share the calm green.
+    assert notify._priority_icon(_item(priority="unset")) == "🟢"
+    assert notify._priority_icon(_item(priority=None)) == "🟢"
+    assert notify._priority_icon(_item(priority="")) == "🟢"
 
 
 def test_priority_icon_case_insensitive():
-    assert notify._priority_icon(_item(priority="HIGH")) == "🔴"
-    assert notify._priority_icon(_item(priority="Normal")) == "🟢"
-    assert notify._priority_icon(_item(priority="LOW")) == "⚪"
+    assert notify._priority_icon(_item(priority="HIGH")) == "🔥"
+    assert notify._priority_icon(_item(priority="Normal")) == "🟡"
+    assert notify._priority_icon(_item(priority="LOW")) == "🟢"
 
 
 def test_priority_icon_dead_keys_removed():
-    # "urgent" and "medium" were pre-taxonomy dead keys — now fall through to ⚪.
-    assert notify._priority_icon(_item(priority="urgent")) == "⚪"
-    assert notify._priority_icon(_item(priority="medium")) == "⚪"
+    # "urgent" and "medium" were pre-taxonomy dead keys — now fall through to 🟢.
+    assert notify._priority_icon(_item(priority="urgent")) == "🟢"
+    assert notify._priority_icon(_item(priority="medium")) == "🟢"
 
 
 # --------------------------------------------------------------------------- #
@@ -166,8 +166,10 @@ def test_header_zero_overdue():
 # --------------------------------------------------------------------------- #
 def test_plain_new_block_layout():
     card = notify.render_card([_item()], [], now=NOW, mode="plain")
-    assert "🔴 Mariia Ivanova" in card  # high → 🔴, no bold markup
-    assert "📍 Mobile internal · 🕒 04.06 10:00" in card  # absolute send time, never stale
+    assert "🔥 Mariia Ivanova" in card  # high → 🔥, no bold markup
+    # Source line: group icon + space name (no role → no role prefix).
+    assert "👥 Mobile internal" in card
+    assert "🕒 04.06 10:00" in card  # absolute send time, never stale, own line
     assert "💬 API audit: enumerate group-chat system messages" in card  # summary line
     # The original message appears under a labelled cut (distinct from the summary).
     assert "   Original message" in card
@@ -177,7 +179,7 @@ def test_plain_new_block_layout():
 
 def test_gchat_new_block_uses_chat_markup():
     card = notify.render_card([_item()], [], now=NOW, mode="gchat")
-    assert "🔴 *Mariia Ivanova*" in card  # *bold*
+    assert "🔥 *Mariia Ivanova*" in card  # *bold*
     assert "<https://chat.google.com/room/AAQAugHrEgY|🔗 Open in Chat>" in card
     # Exactly ONE link line, pointing at the room URL.
     assert card.count("🔗 Open in Chat") == 1
@@ -185,7 +187,7 @@ def test_gchat_new_block_uses_chat_markup():
 
 def test_tg_html_new_block_uses_html_markup():
     card = notify.render_card([_item()], [], now=NOW, mode="tg_html")
-    assert "🔴 <b>Mariia Ivanova</b>" in card
+    assert "🔥 <b>Mariia Ivanova</b>" in card
     assert (
         '<a href="https://chat.google.com/room/AAQAugHrEgY">🔗 Open in Chat</a>'
         in card
@@ -195,31 +197,32 @@ def test_tg_html_new_block_uses_html_markup():
 
 
 # --------------------------------------------------------------------------- #
-# Telegram expandable blockquote — collapse the ORIGINAL MESSAGE, link stays visible.
-# The visible 💬 line is the (short) summary; the full message goes under the cut.
+# Telegram expandable blockquotes — the FULL summary AND the original message
+# each get their own collapsed-by-default quote; the link stays visible after.
 # --------------------------------------------------------------------------- #
-def test_tg_html_original_message_wrapped_in_expandable_blockquote():
+def test_tg_html_summary_and_original_message_each_in_expandable_blockquote():
     card = notify.render_card([_item()], [], now=NOW, mode="tg_html")
-    assert "<blockquote expandable>" in card
-    assert "</blockquote>" in card
-    # The ORIGINAL MESSAGE lives inside the quote; the summary stays on the 💬 line.
-    qstart = card.index("<blockquote expandable>")
-    qend = card.index("</blockquote>")
-    assert "hello there" in card[qstart:qend]            # message under the cut
-    assert "API audit" not in card[qstart:qend]          # summary NOT in the quote
-    assert "💬 API audit: enumerate group-chat system messages" in card
-    # Body stays plain inside the quote (no <code>); auto-link guard only splices a
-    # zero-width joiner into intra-word dots, of which this text has none.
+    # Two distinct quotes: the FULL summary on the 💬 line, the original under the cut.
+    assert card.count("<blockquote expandable>") == 2
+    assert card.count("</blockquote>") == 2
+    # The summary is shown IN FULL inside its own expandable quote.
+    assert (
+        "💬 <blockquote expandable>API audit: enumerate group-chat system messages"
+        "</blockquote>" in card
+    )
+    # The original message lives in its own quote under the labelled cut.
     assert "<blockquote expandable>hello there</blockquote>" in card
+    # The summary quote precedes the original-message quote.
+    assert card.index("API audit") < card.index("hello there")
 
 
 def test_tg_html_link_is_outside_the_blockquote():
     # The link must remain visible while the quote is collapsed → it appears
     # AFTER the closing </blockquote>, never inside the quote.
     card = notify.render_card([_item()], [], now=NOW, mode="tg_html")
-    close = card.index("</blockquote>")
+    close = card.rindex("</blockquote>")  # the LAST quote (original-message cut)
     link = card.index('<a href="https://chat.google.com/')
-    assert link > close  # link comes after the quote closes
+    assert link > close  # link comes after the final quote closes
     # And the link is not nested inside an open quote.
     assert "<blockquote" not in card[close + len("</blockquote>"):]
 
@@ -237,12 +240,13 @@ def test_tg_html_message_cap_higher_than_plain():
 
 
 def test_tg_html_no_message_block_when_no_distinct_summary():
-    # No context_summary → the text IS the summary line; no separate expandable cut
-    # (and so no empty/duplicate blockquote).
+    # No context_summary → the text IS the (full, expandable) summary line, so there
+    # is exactly ONE quote and NO separate original-message cut (no duplication).
     blank = _item(context_summary="", text="just a short dm")
     card = notify.render_card([blank], [], now=NOW, mode="tg_html")
-    assert "<blockquote" not in card
-    assert "💬 just a short dm" in card
+    assert card.count("<blockquote expandable>") == 1
+    assert "💬 <blockquote expandable>just a short dm</blockquote>" in card
+    assert "Original message" not in card  # no separate cut
 
 
 def test_deautolink_breaks_domains_tg_html_only():
@@ -282,9 +286,10 @@ def test_tg_html_blockquote_injection_cannot_break_out():
         text="</blockquote><script>alert(1)</script><blockquote>x",
     )
     card = notify.render_card([evil], [], now=NOW, mode="tg_html")
-    # Only OUR own opening/closing tags exist — the injected ones are escaped.
-    assert card.count("<blockquote expandable>") == 1
-    assert card.count("</blockquote>") == 1
+    # Two of OUR OWN quotes (full summary + original-message cut); the injected
+    # tags inside the message body are escaped, not counted as ours.
+    assert card.count("<blockquote expandable>") == 2
+    assert card.count("</blockquote>") == 2
     assert "&lt;/blockquote&gt;" in card
     assert "&lt;blockquote&gt;" in card
     assert "<script>" not in card
@@ -302,18 +307,21 @@ def test_gchat_and_plain_summary_not_in_blockquote():
 def test_dm_location_label():
     dm = _item(trigger="direct_dm", space_type="DIRECT_MESSAGE", space_display=None)
     card = notify.render_card([dm], [], now=NOW, mode="plain")
-    assert "Direct message ·" in card
+    # A DM is a person source: 👤 person icon + the localized "Direct message".
+    assert "👤 Direct message" in card
 
 
-def test_summary_falls_back_to_text_and_truncates():
+def test_summary_falls_back_to_text_full_no_truncation():
     long = _item(context_summary="", text="A" * 300)
     card = notify.render_card([long], [], now=NOW, mode="plain")
-    # No distinct summary → the text fills the 💬 line, truncated to ~140 + ellipsis.
+    # No distinct summary → the text fills the 💬 line. The default profile shows the
+    # summary in FULL (no truncation); plain has no native collapse, so all 300 chars
+    # appear with NO ellipsis.
     line = [ln for ln in card.splitlines() if "A" in ln][0]
     assert line.startswith("💬 ")
     body = line[len("💬 "):]
-    assert body.endswith("…")
-    assert len(body) <= 141
+    assert not body.endswith("…")
+    assert body == "A" * 300
 
 
 def test_link_omitted_when_no_permalink():
@@ -348,7 +356,7 @@ def test_overdue_unspecified_promise():
 def test_cap_adds_overflow_block():
     new = [_item(f"n{i}") for i in range(25)]
     card = notify.render_card(new, [], now=NOW, mode="plain", cap=10)
-    icon_lines = [ln for ln in card.splitlines() if ln.startswith("🔴")]
+    icon_lines = [ln for ln in card.splitlines() if ln.startswith("🔥")]
     assert len(icon_lines) == 10
     assert "…and 15 more new" in card
 
@@ -356,7 +364,7 @@ def test_cap_adds_overflow_block():
 def test_cap_zero_means_no_cap():
     new = [_item(f"n{i}") for i in range(15)]
     card = notify.render_card(new, [], now=NOW, mode="plain", cap=0)
-    icon_lines = [ln for ln in card.splitlines() if ln.startswith("🔴")]
+    icon_lines = [ln for ln in card.splitlines() if ln.startswith("🔥")]
     assert len(icon_lines) == 15
     assert "more new" not in card
 
@@ -549,3 +557,139 @@ def test_context_summary_passthrough_plain():
     it = _item(context_summary="a & b < c > d")
     card = notify.render_card([it], [], now=NOW, mode="plain")
     assert "a & b < c > d" in card
+
+
+# --------------------------------------------------------------------------- #
+# Sender role resolution (_bare_id / _role_map / _attach_roles).
+# --------------------------------------------------------------------------- #
+def test_bare_id_strips_users_prefix():
+    assert notify._bare_id("users/123") == "123"
+    assert notify._bare_id("123") == "123"
+    assert notify._bare_id(None) == ""
+
+
+def test_role_map_config_wins_over_directory(monkeypatch, tmp_path):
+    # Directory cache provides a sparse fallback; config user_profiles override it.
+    cache = tmp_path / "name_cache.json"
+    cache.write_text(
+        '{"profiles": {"111": {"role": "Stale Title"}, "222": {"role": "Designer"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(notify.google_chat, "_DIRECTORY_CACHE_PATH", cache)
+    cfg = {"user_profiles": {"users/111": {"role": "Engineering Manager"}}}
+    rmap = notify._role_map(cfg)
+    assert rmap["111"] == "Engineering Manager"  # config overrides directory
+    assert rmap["222"] == "Designer"             # directory-only fallback kept
+
+
+def test_role_map_missing_cache_is_config_only(monkeypatch, tmp_path):
+    missing = tmp_path / "nope.json"
+    monkeypatch.setattr(notify.google_chat, "_DIRECTORY_CACHE_PATH", missing)
+    cfg = {"user_profiles": {"users/abc": {"role": "QA Engineer"}}}
+    assert notify._role_map(cfg) == {"abc": "QA Engineer"}
+
+
+def test_attach_roles_stamps_copies_without_mutating_store():
+    item = {"id": "x", "sender_id": "users/777"}
+    rmap = {"777": "Backend Developer"}
+    out = notify._attach_roles([item], rmap)
+    assert out[0]["sender_role"] == "Backend Developer"
+    assert "sender_role" not in item  # original store dict untouched
+
+
+def test_attach_roles_no_map_returns_input():
+    items = [{"id": "x", "sender_id": "users/1"}]
+    assert notify._attach_roles(items, {}) is items
+
+
+def test_attach_roles_preserves_existing_role():
+    item = {"id": "x", "sender_id": "users/1", "sender_role": "Pre-set"}
+    out = notify._attach_roles([item], {"1": "From Map"})
+    assert out[0]["sender_role"] == "Pre-set"
+
+
+# --------------------------------------------------------------------------- #
+# _pack_items / TelegramSender chunking — a digest over the 4096 cap must be
+# split into multiple whole-card messages, each valid HTML under the limit
+# (regression: full summaries pushed digests past the cap and text[:limit]
+# sliced through <blockquote>, yielding Telegram 400 "can't parse entities").
+# --------------------------------------------------------------------------- #
+def test_pack_items_splits_when_over_limit():
+    # render_fn returns a string 30 chars per item; limit 100 → 3 per batch.
+    items = list(range(10))
+    batches = notify._pack_items(items, lambda b: "x" * (30 * len(b)), 100)
+    assert [len(b) for b in batches] == [3, 3, 3, 1]
+    assert [x for b in batches for x in b] == items  # order + completeness preserved
+
+
+def test_pack_items_oversized_single_item_is_its_own_batch():
+    batches = notify._pack_items([1, 2], lambda b: "x" * (200 * len(b)), 100)
+    assert batches == [[1], [2]]  # each alone exceeds limit → emitted solo
+
+
+def test_pack_items_empty_returns_empty():
+    assert notify._pack_items([], lambda b: "", 100) == []
+
+
+def _long_item(i):
+    return _item(
+        iid=f"big{i}",
+        sender_name=f"Sender {i}",
+        context_summary=("Lorem ipsum dolor sit amet " * 30).strip(),
+        text=("original message body " * 20).strip(),
+    )
+
+
+def test_telegram_send_splits_long_digest_into_valid_messages(monkeypatch):
+    sender = notify.TelegramSender(
+        cfg={"channels": {"telegram": {"enabled": True}}},
+        secrets={"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_CHAT_ID": "C"},
+    )
+    sent: list = []
+
+    def fake_post(url, payload):
+        sent.append(payload["text"])
+        return {"ok": True}
+
+    monkeypatch.setattr(sender, "_http_post", fake_post)
+    items = [_long_item(i) for i in range(12)]
+    # Sanity: a single render would blow past the cap (the bug precondition).
+    assert len(sender._render(items, [], NOW)) > sender._TEXT_LIMIT
+
+    assert sender.send(items, [], NOW) is True
+    assert len(sent) >= 2  # actually chunked
+    for text in sent:
+        assert len(text) <= sender._TEXT_LIMIT
+        # Never sliced mid-tag: blockquote/b/a open and close counts match.
+        assert text.count("<blockquote") == text.count("</blockquote>")
+        assert text.count("<b>") == text.count("</b>")
+        assert text.count("<a ") == text.count("</a>")
+    # Every card landed in exactly one message (no loss, no dup).
+    assert sum(t.count("🕒") for t in sent) == 12
+
+
+def test_telegram_send_short_digest_is_single_message(monkeypatch):
+    sender = notify.TelegramSender(
+        cfg={"channels": {"telegram": {"enabled": True}}},
+        secrets={"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_CHAT_ID": "C"},
+    )
+    sent: list = []
+    monkeypatch.setattr(sender, "_http_post", lambda u, p: sent.append(p["text"]) or {"ok": True})
+    assert sender.send([_item()], [], NOW) is True
+    assert len(sent) == 1
+
+
+def test_telegram_send_reports_failure_when_a_chunk_fails(monkeypatch):
+    sender = notify.TelegramSender(
+        cfg={"channels": {"telegram": {"enabled": True}}},
+        secrets={"TELEGRAM_BOT_TOKEN": "T", "TELEGRAM_CHAT_ID": "C"},
+    )
+    calls = {"n": 0}
+
+    def flaky_post(url, payload):
+        calls["n"] += 1
+        return {"ok": True} if calls["n"] == 1 else {"ok": False, "description": "boom"}
+
+    monkeypatch.setattr(sender, "_http_post", flaky_post)
+    items = [_long_item(i) for i in range(12)]
+    assert sender.send(items, [], NOW) is False  # one chunk failed → overall False

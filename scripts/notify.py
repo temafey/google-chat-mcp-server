@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+import json
 import re
 import sys
 from abc import ABC, abstractmethod
@@ -299,6 +300,31 @@ def pinned_candidates(store_data: dict) -> list:
     return [it for it in store.open_items(store_data) if it.get("pinned")]
 
 
+def nudge_candidates(store_data: dict, cfg: dict) -> list:
+    """Tier-3 reply-nudge candidates: OPEN items I still owe a reply, with
+    generated suggestions, not yet nudged.
+
+    The analysis stage (``analyze_mentions.run_reply_nudge``) is what applies the
+    priority/age threshold (high after 10 min, normal after 30 min, low never)
+    and writes ``reply_suggestions`` only when I have NOT replied. This dispatcher
+    is deterministic: it fires for every open item that already carries
+    suggestions and has not been nudged yet (``reply_nudged_at`` unset), skipping
+    any the checker later marked answered (``response_posted``). One nudge per
+    item — ``run_nudge`` stamps ``reply_nudged_at`` on a successful send. Sorted
+    high-priority first (low never reaches here — it gets no suggestions)."""
+    items = [
+        it
+        for it in store.open_items(store_data)
+        if it.get("reply_suggestions")
+        and it.get("reply_nudged_at") is None
+        and not it.get("response_posted")
+    ]
+    return sorted(
+        items,
+        key=lambda it: _PRIORITY_ORDER.get((it.get("priority") or "").lower(), 2),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Sender plugin architecture.
 # --------------------------------------------------------------------------- #
@@ -322,6 +348,16 @@ class Sender(ABC):
         """
         ...
 
+    @abstractmethod
+    def send_nudge(self, items: list, now) -> bool:  # pragma: no cover
+        """Render + deliver the Tier-3 reply-nudge digest (a SEPARATE message).
+
+        ``items`` are open items I haven't answered yet, each possibly carrying
+        ``reply_suggestions`` (collapsible + copyable on Telegram). Same channel
+        dialect and ``now`` semantics as :meth:`send`.
+        """
+        ...
+
 
 class ConsoleSender(Sender):
     """Always available; prints the PLAIN Card digest to stdout (cron logs)."""
@@ -336,6 +372,10 @@ class ConsoleSender(Sender):
 
     def send(self, new_items: list, esc_items: list, now) -> bool:
         print(build_digest(new_items, esc_items, now=now, templates_cfg=self._templates))
+        return True
+
+    def send_nudge(self, items: list, now) -> bool:
+        print(templates.render_nudge(items, now=now, mode="plain", templates_cfg=self._templates))
         return True
 
 
@@ -363,6 +403,16 @@ class GCInboxSender(Sender):
             new_items, esc_items, now=now, mode="gchat", link_fn=chat_room_link,
             templates_cfg=self._templates,
         )
+        return self._post(text)
+
+    def send_nudge(self, items: list, now) -> bool:
+        text = templates.render_nudge(
+            items, now=now, mode="gchat", link_fn=chat_room_link,
+            templates_cfg=self._templates,
+        )
+        return self._post(text)
+
+    def _post(self, text: str) -> bool:
         # The sole network/write call. ``send_message`` is async in
         # google_chat.py; bridge it for this sync dispatcher. Tests may patch
         # google_chat.send_message with either a coroutine or a plain function.
@@ -376,6 +426,27 @@ class GCInboxSender(Sender):
             )
             return False
         return True
+
+
+def _pack_items(items: list, render_fn, limit: int) -> list:
+    """Greedily pack ``items`` into batches whose rendered length is <= ``limit``.
+
+    ``render_fn(batch)`` renders a candidate batch to its final channel string.
+    Items are kept in order; a batch grows until the next item would push the
+    render over ``limit``, then a new batch starts. An item that alone renders
+    over ``limit`` is emitted as its own (oversized) batch — the caller is
+    expected to hard-cap it as a last resort. Returns [] for empty input."""
+    batches: list = []
+    cur: list = []
+    for it in items:
+        if cur and len(render_fn(cur + [it])) > limit:
+            batches.append(cur)
+            cur = [it]
+        else:
+            cur.append(it)
+    if cur:
+        batches.append(cur)
+    return batches
 
 
 class TelegramSender(Sender):
@@ -432,10 +503,69 @@ class TelegramSender(Sender):
     def send(self, new_items: list, esc_items: list, now) -> bool:
         # Render the Telegram HTML dialect. ALL dynamic text is html-escaped
         # inside render_card (SECURITY: fetched Chat text is untrusted data).
-        text = render_card(
+        #
+        # Telegram rejects a message over 4096 chars, and a naive ``text[:limit]``
+        # truncation slices through HTML tags (e.g. mid ``<blockquote>``) → the API
+        # returns 400 "can't parse entities". Since the full-summary feature lets a
+        # multi-card digest grow well past the limit, pack the cards into as many
+        # whole messages as needed — each rendered independently so every message
+        # is valid, self-contained HTML under the cap. One card never spans two
+        # messages. Sends them in order; ALL must succeed for the send to count.
+        messages = self._render_messages(new_items, esc_items, now)
+        all_ok = True
+        for text in messages:
+            if not self._send_one(text):
+                all_ok = False
+        return all_ok
+
+    def send_nudge(self, items: list, now) -> bool:
+        # Same chunk-to-stay-under-4096 discipline as ``send`` (a nudge card with
+        # 2-3 suggestion lines can be long): pack at item boundaries, render each
+        # batch as self-contained HTML, send in order; ALL must succeed.
+        messages = self._render_nudge_messages(items, now)
+        all_ok = True
+        for text in messages:
+            if not self._send_one(text):
+                all_ok = False
+        return all_ok
+
+    def _render(self, new_items: list, esc_items: list, now) -> str:
+        return render_card(
             new_items, esc_items, now=now, mode="tg_html", link_fn=chat_room_link,
             templates_cfg=self._templates,
         )
+
+    def _render_nudge(self, items: list, now) -> str:
+        return templates.render_nudge(
+            items, now=now, mode="tg_html", link_fn=chat_room_link,
+            templates_cfg=self._templates,
+        )
+
+    def _render_nudge_messages(self, items: list, now) -> list:
+        """Split the nudge digest into >=1 rendered HTML messages, each <= cap."""
+        limit = self._TEXT_LIMIT
+        batches = _pack_items(items, lambda b: self._render_nudge(b, now), limit)
+        if not batches:
+            return [self._render_nudge(items, now)]
+        return [self._render_nudge(b, now) for b in batches]
+
+    def _render_messages(self, new_items: list, esc_items: list, now) -> list:
+        """Split a digest into >=1 rendered HTML messages, each <= the char cap.
+
+        Cards are packed greedily at item boundaries: new items first (each
+        message re-renders its own header), then escalation items. A single card
+        that alone exceeds the cap is emitted on its own (then hard-capped as a
+        last resort — realistically unreachable given per-field caps)."""
+        limit = self._TEXT_LIMIT
+        batches = (
+            [(b, []) for b in _pack_items(new_items, lambda b: self._render(b, [], now), limit)]
+            + [([], b) for b in _pack_items(esc_items, lambda b: self._render([], b, now), limit)]
+        )
+        if not batches:
+            return [self._render(new_items, esc_items, now)]
+        return [self._render(n, e, now) for (n, e) in batches]
+
+    def _send_one(self, text: str) -> bool:
         # Build the token-bearing URL locally; it must never escape this scope.
         url = f"https://api.telegram.org/bot{self._token}/sendMessage"
         payload = {
@@ -488,6 +618,25 @@ def _dispatch(senders: list, new_items: list, esc_items: list, now) -> list:
     return succeeded
 
 
+def _dispatch_nudge(senders: list, items: list, now) -> list:
+    """Send the reply-nudge digest to every sender; isolate per-sender failures.
+
+    Returns the names of senders that succeeded. Mirrors :func:`_dispatch` but
+    drives each sender's :meth:`Sender.send_nudge`."""
+    succeeded = []
+    for sender in senders:
+        try:
+            ok = sender.send_nudge(items, now)
+        except Exception as exc:  # noqa: BLE001 - isolate sender failures
+            print(f"[notify] nudge sender {sender.name!r} raised: {exc}", file=sys.stderr)
+            ok = False
+        if ok:
+            succeeded.append(sender.name)
+        else:
+            print(f"[notify] nudge sender {sender.name!r} reported failure", file=sys.stderr)
+    return succeeded
+
+
 # --------------------------------------------------------------------------- #
 # Digest.
 # --------------------------------------------------------------------------- #
@@ -505,12 +654,13 @@ _INDENT = "   "
 _LINK_LABEL = "🔗 Open in Chat"
 
 # Priority → icon. Taxonomy: high | normal | low | unset.
-# high → 🔴, normal → 🟢, low/unset/unknown → ⚪.
+# high → 🔥, normal → 🟡, low/unset/unknown → 🟢 (low and "no priority yet"
+# share the calm-green marker so an un-analyzed item never looks alarming).
 # "urgent" and "medium" were pre-taxonomy dead keys — removed.
 _PRIORITY_ICON = {
-    "high": "🔴",
-    "normal": "🟢",
-    "low": "⚪",
+    "high": "🔥",
+    "normal": "🟡",
+    "low": "🟢",
 }
 
 
@@ -550,7 +700,7 @@ def chat_room_link(item: dict):
 
 
 def _priority_icon(item: dict) -> str:
-    return _PRIORITY_ICON.get((item.get("priority") or "").lower(), "⚪")
+    return _PRIORITY_ICON.get((item.get("priority") or "").lower(), "🟢")
 
 
 def _is_dm(item: dict) -> bool:
@@ -716,6 +866,53 @@ def _set_item_fields(store_data: dict, item_id: str, fields: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Sender role resolution (for the person/group source line in the digest).
+#
+# The mentioning person's job role drives the role icon. Authoritative source is
+# the config ``user_profiles`` map (keyed "users/<id>"); the directory cache
+# (``name_cache.json`` profiles, keyed bare numeric id) is a sparse fallback.
+# Read-only, best-effort, never raises — a missing role just omits the icon.
+# --------------------------------------------------------------------------- #
+def _bare_id(sid) -> str:
+    s = str(sid or "")
+    return s[len("users/"):] if s.startswith("users/") else s
+
+
+def _role_map(cfg: dict) -> dict:
+    """Build {bare_numeric_id: role}. Directory cache first (fallback), then
+    config ``user_profiles`` on top (authoritative override). Never raises."""
+    out: dict = {}
+    try:
+        cache = json.loads(google_chat._DIRECTORY_CACHE_PATH.read_text("utf-8"))
+        for k, prof in (cache.get("profiles") or {}).items():
+            role = (prof or {}).get("role")
+            if role:
+                out[_bare_id(k)] = role
+    except Exception:
+        pass  # no cache / unreadable → config-only
+    for k, prof in (cfg.get("user_profiles") or {}).items():
+        role = (prof or {}).get("role")
+        if role:
+            out[_bare_id(k)] = role
+    return out
+
+
+def _attach_roles(items: list, role_map: dict) -> list:
+    """Return shallow COPIES of ``items`` with ``sender_role`` stamped from
+    ``role_map`` (by sender_id). Copies so the store dict is never mutated; an
+    item that already carries a sender_role is left untouched."""
+    if not role_map:
+        return items
+    out = []
+    for it in items:
+        role = role_map.get(_bare_id(it.get("sender_id")))
+        if role and not it.get("sender_role"):
+            it = {**it, "sender_role": role}
+        out.append(it)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Dispatch cycle.
 # --------------------------------------------------------------------------- #
 def run_once(
@@ -787,6 +984,14 @@ def run_once(
     render_new = notify_new + ride_pins
     result["pinned_ridealong"] = [it["id"] for it in ride_pins]
 
+    # Stamp the mentioning person's role onto RENDER-ONLY copies (the digest
+    # shows a role icon + label on the source line). Copies so the store dict is
+    # never mutated; the originals (notify_new / esc_cands) drive marking
+    # notified below. Escalation/overdue blocks render no role, so esc_cands is
+    # left as-is.
+    role_map = _role_map(cfg)
+    render_new = _attach_roles(render_new, role_map)
+
     if dry_run:
         print("[notify] DRY-RUN — would dispatch (no send, no persist):")
         print(build_digest(render_new, esc_cands, now=now, templates_cfg=cfg.get("templates")))
@@ -820,6 +1025,82 @@ def run_once(
     return result
 
 
+def run_nudge(
+    store_data: dict,
+    cfg: dict,
+    *,
+    now=None,
+    dry_run: bool = False,
+    store_path=None,
+    senders: list | None = None,
+) -> dict:
+    """Run one Tier-3 reply-nudge dispatch cycle (SEPARATE from :func:`run_once`).
+
+    Dispatches the reply-nudge digest for open items I still owe a reply, then
+    stamps ``reply_nudged_at`` (one nudge per item) iff at least one sender
+    succeeded. Gated OFF unless ``analyze.reply_nudge.enabled``. Honours the same
+    R5 kill switch and quiet hours as the main digest; quiet hours HOLD nudges
+    (no stamp) rather than dropping them. Never raises on a sender failure;
+    persists nothing under ``dry_run``."""
+    now = _resolve_now(cfg, now)
+    result = {
+        "skipped": False,
+        "muted": False,
+        "quiet": False,
+        "dry_run": dry_run,
+        "nudged": [],
+        "senders_succeeded": [],
+    }
+
+    # Feature gate — the reply-nudge subsystem is opt-in. When off, the analysis
+    # stage writes no suggestions anyway, so this is belt-and-suspenders + a fast
+    # exit that keeps quiet cron logs clean.
+    nudge_cfg = (cfg.get("analyze") or {}).get("reply_nudge") or {}
+    if not nudge_cfg.get("enabled"):
+        result["skipped"] = True
+        return result
+
+    # R5 kill switch — emit nothing.
+    if not config.is_active(cfg, now=now):
+        result["muted"] = True
+        return result
+
+    # Quiet hours HOLD nudges (do not stamp; they fire on the next active cycle).
+    if in_quiet_hours(now, cfg):
+        result["quiet"] = True
+        return result
+
+    cands = nudge_candidates(store_data, cfg)
+    if not cands:
+        return result
+
+    # Stamp the sender's role onto RENDER-ONLY copies (the nudge block shows a
+    # role icon + label), exactly like the main digest. Originals drive the
+    # ``reply_nudged_at`` stamp below.
+    render_items = _attach_roles(cands, _role_map(cfg))
+
+    if dry_run:
+        print("[notify] DRY-RUN nudge — would dispatch (no send, no persist):")
+        print(templates.render_nudge(render_items, now=now, mode="plain", templates_cfg=cfg.get("templates")))
+        result["nudged"] = [it["id"] for it in cands]
+        return result
+
+    active = build_senders(cfg) if senders is None else senders
+    succeeded = _dispatch_nudge(active, render_items, now)
+    result["senders_succeeded"] = succeeded
+
+    if succeeded:
+        now_iso = _iso(now)
+        for it in cands:
+            _set_item_fields(store_data, it["id"], {"reply_nudged_at": now_iso})
+        store.save(store_data, store_path)
+        result["nudged"] = [it["id"] for it in cands]
+    else:
+        print("[notify] nudge: no sender succeeded — items NOT marked nudged")
+
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # CLI.
 # --------------------------------------------------------------------------- #
@@ -835,6 +1116,23 @@ def _format_result(result: dict) -> str:
         f"dry_run={result['dry_run']}",
     ]
     return "dispatch: " + " ".join(parts)
+
+
+def _format_nudge_result(result: dict) -> str | None:
+    """One-line summary of a nudge cycle, or None when the feature is off (so a
+    disabled subsystem prints nothing in cron logs)."""
+    if result.get("skipped"):
+        return None
+    if result.get("muted"):
+        return "nudge: muted — nothing sent"
+    if result.get("quiet"):
+        return "nudge: quiet hours — held"
+    return (
+        "nudge: "
+        f"nudged={len(result['nudged'])} "
+        f"senders={','.join(result['senders_succeeded']) or '-'} "
+        f"dry_run={result['dry_run']}"
+    )
 
 
 def main(argv=None) -> int:
@@ -857,6 +1155,19 @@ def main(argv=None) -> int:
         store_path=args.store_path,
     )
     print(_format_result(result))
+
+    # Tier-3 reply nudges — a SEPARATE dispatch pass on the same store snapshot
+    # (run_once already persisted its own field updates into store_data). No-op
+    # unless analyze.reply_nudge.enabled, so it is silent by default.
+    nudge_result = run_nudge(
+        store_data,
+        cfg,
+        dry_run=args.dry_run,
+        store_path=args.store_path,
+    )
+    line = _format_nudge_result(nudge_result)
+    if line:
+        print(line)
     return 0
 
 

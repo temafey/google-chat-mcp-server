@@ -97,7 +97,8 @@ def test_compact_profile_is_single_line_no_message_no_link():
         [_item()], [], now=NOW, mode="plain", templates_cfg=_tcfg(active_profile="compact")
     )
     # Absolute send time (never goes stale), not a relative age, in the meta line.
-    assert "🟢 Mariia Ivanova · Mobile internal · 04.06 10:00" in card
+    # normal → 🟡; group space → 👥 before the source name.
+    assert "🟡 Mariia Ivanova · 👥 Mobile internal · 04.06 10:00" in card
     assert "💬 short human summary" in card
     assert "Original message" not in card  # compact hides the cut
     assert "🔗" not in card  # compact hides the link
@@ -118,7 +119,8 @@ def test_unknown_active_profile_falls_back_to_default_layout():
         [_item()], [], now=NOW, mode="plain", templates_cfg=_tcfg(active_profile="does-not-exist")
     )
     # Default labelled layout still renders (no crash, no bare placeholder).
-    assert "📍 Mobile internal · 🕒 04.06 10:00" in card
+    assert "👥 Mobile internal" in card
+    assert "🕒 04.06 10:00" in card
     assert "$" not in card
 
 
@@ -173,7 +175,7 @@ def test_pinned_item_renders_pin_icon_override():
     pinned = _item(priority="normal", pinned=True, context_summary="s", text="body")
     card = notify.render_card([pinned], [], now=NOW, mode="plain", templates_cfg=_tcfg())
     assert "📌" in card
-    assert "🟢" not in card  # the 'normal' priority icon is overridden
+    assert "🟡" not in card  # the 'normal' priority icon is overridden
 
 
 def test_pinned_variant_routes_to_detailed():
@@ -232,7 +234,7 @@ def test_no_format_string_injection():
 def test_profile_new_cap_applies_without_explicit_cap():
     items = [_item(f"n{i}", priority="normal") for i in range(14)]
     card = notify.render_card(items, [], now=NOW, mode="plain", templates_cfg=_tcfg())  # default cap 10
-    icon_lines = [ln for ln in card.splitlines() if ln.startswith("🟢")]
+    icon_lines = [ln for ln in card.splitlines() if ln.startswith("🟡")]
     assert len(icon_lines) == 10
     assert "…and 4 more new" in card
 
@@ -240,7 +242,7 @@ def test_profile_new_cap_applies_without_explicit_cap():
 def test_explicit_cap_overrides_profile_cap():
     items = [_item(f"n{i}", priority="normal") for i in range(14)]
     card = notify.render_card(items, [], now=NOW, mode="plain", templates_cfg=_tcfg(), cap=3)
-    icon_lines = [ln for ln in card.splitlines() if ln.startswith("🟢")]
+    icon_lines = [ln for ln in card.splitlines() if ln.startswith("🟡")]
     assert len(icon_lines) == 3
     assert "…and 11 more new" in card
 
@@ -440,3 +442,75 @@ def test_overdue_block_uses_localized_month_and_reltime():
     )
     card = notify.render_card([], [overdue], now=NOW, mode="plain", templates_cfg=_tcfg(locale="ru"))
     assert "до 03 июн 15:00" in card
+
+
+# --------------------------------------------------------------------------- #
+# Role icons + person/group source split.
+# --------------------------------------------------------------------------- #
+def test_role_icon_keyword_rules():
+    t = templates.DEFAULT_TEMPLATES
+    # First-match-wins ordering: QA before generic engineer; tech-lead before dev.
+    assert templates._role_icon("Back-End Tech Lead", t) == "🛠"
+    assert templates._role_icon("Staff Software Engineer (QA)", t) == "🧪"
+    assert templates._role_icon("Engineering Manager", t) == "🧭"
+    assert templates._role_icon("Senior Backend Developer", t) == "💻"
+    assert templates._role_icon("Chief Executive Officer", t) == "👑"
+    assert templates._role_icon("DevOps Engineer", t) == "⚙️"
+    assert templates._role_icon("Product Manager", t) == "📦"
+
+
+def test_role_icon_default_for_unknown_or_empty():
+    t = templates.DEFAULT_TEMPLATES
+    assert templates._role_icon("", t) == "👤"
+    assert templates._role_icon("Supreme Wizard of Nothing", t) == "👤"
+
+
+def test_role_line_rendered_when_sender_role_present():
+    it = _item(priority="high", sender_role="Back-End Tech Lead")
+    card = notify.render_card([it], [], now=NOW, mode="plain", templates_cfg=_tcfg())
+    # Role icon + role text · group icon + space, all on the source line.
+    assert "🛠 Back-End Tech Lead · 👥 Mobile internal" in card
+
+
+def test_role_line_omitted_when_no_role():
+    it = _item(priority="high")  # no sender_role
+    card = notify.render_card([it], [], now=NOW, mode="plain", templates_cfg=_tcfg())
+    # Bare source line: group icon + space, no role prefix, no dangling separator.
+    assert "👥 Mobile internal" in card
+    assert "· 👥" not in card
+
+
+def test_person_source_icon_for_dm():
+    dm = _item(priority="high", trigger="direct_dm", space_type="DIRECT_MESSAGE", space_display=None)
+    card = notify.render_card([dm], [], now=NOW, mode="plain", templates_cfg=_tcfg())
+    assert "👤 Direct message" in card
+
+
+def test_group_source_icon_for_space():
+    it = _item(priority="high", space_type="SPACE", space_display="Mobile Team")
+    card = notify.render_card([it], [], now=NOW, mode="plain", templates_cfg=_tcfg())
+    assert "👥 Mobile Team" in card
+
+
+def test_role_text_is_escaped_per_channel():
+    # An injected role string must be escaped like any other untrusted value.
+    it = _item(priority="high", sender_role="<b>boss</b>")
+    card = notify.render_card([it], [], now=NOW, mode="tg_html", templates_cfg=_tcfg())
+    assert "&lt;b&gt;boss&lt;/b&gt;" in card
+    assert "<b>boss</b>" not in card
+
+
+def test_full_summary_in_expandable_blockquote_on_telegram():
+    long_summary = "S" * 600
+    it = _item(priority="high", context_summary=long_summary, text="orig body")
+    card = notify.render_card([it], [], now=NOW, mode="tg_html", templates_cfg=_tcfg())
+    # The summary is shown IN FULL (no truncation) inside an expandable quote.
+    assert f"💬 <blockquote expandable>{long_summary}</blockquote>" in card
+    assert card.count("S") == 600  # nothing trimmed
+
+
+def test_compact_summary_is_inline_not_expandable():
+    it = _item(priority="normal", context_summary="a concise summary", text="body")
+    card = notify.render_card([it], [], now=NOW, mode="tg_html", templates_cfg=_tcfg(active_profile="compact"))
+    assert "blockquote" not in card  # compact keeps the summary inline
+    assert "💬 a concise summary" in card

@@ -139,6 +139,11 @@ def _new_item_skeleton() -> dict:
         "response_text": None,
         "answered_at": None,
         "last_notified": None,
+        # Tier-3 reply nudge (set via set_fields — verbatim, no status churn;
+        # absent on pre-existing on-disk items, where .get(…) is falsy):
+        "reply_checked_at": None,   # ISO of the last READ-ONLY "did I reply?" check
+        "reply_suggestions": None,  # list[str] of generated reply drafts (untrusted)
+        "reply_nudged_at": None,    # ISO when the reply-nudge was sent (one per item)
         # Pin ("starred"): an orthogonal user flag — NOT a status. A pinned open
         # item rides along on every digest until unpinned (see notify.run_once).
         # Toggled via store.set_fields (verbatim, no status churn); absent on
