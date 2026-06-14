@@ -106,7 +106,7 @@ DEFAULT_CONFIG: dict = {
             "run_in_cron": False,
             # Minutes after last_notified before nudging, per priority. A priority
             # absent here (e.g. "low") is NEVER nudged.
-            "thresholds_minutes": {"high": 10, "normal": 30},
+            "thresholds_minutes": {"high": 20, "normal": 30},
             "min_suggestions": 2,
             "max_suggestions": 3,
             # Reply-draft language: "" / "source" mirrors the incoming message

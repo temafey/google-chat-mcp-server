@@ -112,17 +112,17 @@ def _suggest_ok(*suggestions) -> AnalysisResult:
 # --------------------------------------------------------------------------- #
 class TestSelectNudgeItems:
     def test_high_eligible_after_threshold(self):
-        s = _store([_item(priority="high", last_notified=_minutes_ago(15))])
+        s = _store([_item(priority="high", last_notified=_minutes_ago(25))])
         got = am.select_nudge_items(s, _cfg(), NOW)
         assert [it["id"] for it in got] == ["i0"]
 
     def test_high_not_eligible_before_threshold(self):
-        s = _store([_item(priority="high", last_notified=_minutes_ago(5))])
+        s = _store([_item(priority="high", last_notified=_minutes_ago(15))])
         assert am.select_nudge_items(s, _cfg(), NOW) == []
 
     def test_normal_uses_its_own_threshold(self):
-        # 20m: past high(10) but before normal(30) → not yet.
-        s = _store([_item(priority="normal", last_notified=_minutes_ago(20))])
+        # 25m: past high(20) but before normal(30) → not yet.
+        s = _store([_item(priority="normal", last_notified=_minutes_ago(25))])
         assert am.select_nudge_items(s, _cfg(), NOW) == []
         s2 = _store([_item(priority="normal", last_notified=_minutes_ago(40))])
         assert [it["id"] for it in am.select_nudge_items(s2, _cfg(), NOW)] == ["i0"]
