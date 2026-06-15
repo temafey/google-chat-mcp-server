@@ -890,11 +890,22 @@ def _parse_store_iso(value) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
-def detect_my_reply(item: dict, me_id: str, creds, *, fetch_fn=None) -> Optional[bool]:
+def detect_my_reply(
+    item: dict, me_id: str, creds, *, fetch_fn=None, space_fetch_fn=None
+) -> Optional[bool]:
     """READ-ONLY: did *me_id* post in this item's thread/space after the message?
 
-    Prefers the item's thread (precise "did I answer this conversation"); falls
-    back to the whole space for DMs without a thread_name. Returns:
+    Scope of the search depends on the space's threading model:
+
+    * **DIRECT_MESSAGE / GROUP_CHAT** spaces are FLAT — every message is its own
+      thread, so a thread-scoped fetch would return only the original message and
+      never see my reply (which lives in a *sibling* thread of the same space).
+      We therefore scan the whole space there.
+    * **Named SPACE rooms** keep precise thread scoping ("did I answer THIS
+      conversation"), so a reply I posted elsewhere in the room is not mistaken
+      for an answer to this item.
+
+    Returns:
       True  — a message from me_id newer than the item exists,
       False — none found,
       None  — could not determine (no ids / fetch error) → caller skips safely.
@@ -911,13 +922,21 @@ def detect_my_reply(item: dict, me_id: str, creds, *, fetch_fn=None) -> Optional
 
     import google_chat as gchat  # noqa: PLC0415
     fetch_thread = fetch_fn or gchat._list_thread_messages_sync
+    fetch_space = space_fetch_fn or gchat._list_messages_sync
     thread_name = item.get("thread_name") or ""
+    space_type = (item.get("space_type") or "").upper()
+    # Per-message threading in DMs/group chats makes thread scoping useless for
+    # reply detection — fall back to a space-wide scan there (see docstring).
+    use_thread = bool(thread_name) and space_type not in (
+        "DIRECT_MESSAGE",
+        "GROUP_CHAT",
+    )
 
     try:
-        if thread_name:
+        if use_thread:
             messages = fetch_thread(creds, space_name, thread_name, max_messages=50)
         else:
-            messages = gchat._list_messages_sync(creds, space_name, created, None)
+            messages = fetch_space(creds, space_name, created, None)
     except Exception:  # noqa: BLE001 - read failure → undetermined, never raise
         return None
 

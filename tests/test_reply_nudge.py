@@ -201,6 +201,45 @@ class TestDetectMyReply:
         assert am.detect_my_reply(item, "117216798078927891621", creds=None,
                                   fetch_fn=lambda *a, **k: msgs) is True
 
+    def test_dm_scans_space_not_its_own_thread(self):
+        # Regression: in a DIRECT_MESSAGE space every message is its OWN thread,
+        # so my reply lives in a SIBLING thread. The per-message thread fetch
+        # therefore returns nothing — detection must scan the whole space instead.
+        item = _item(space_type="DIRECT_MESSAGE",
+                     thread_name="spaces/X/threads/their-msg",
+                     created_time="2026-06-13T11:00:00Z")
+        thread_only = []  # the original message's own thread carries no reply
+        space_msgs = [{"sender": {"name": ME}, "createTime": "2026-06-13T11:05:00Z"}]
+        assert am.detect_my_reply(
+            item, ME, creds=None,
+            fetch_fn=lambda *a, **k: thread_only,
+            space_fetch_fn=lambda *a, **k: space_msgs,
+        ) is True
+
+    def test_group_chat_scans_space(self):
+        item = _item(space_type="GROUP_CHAT",
+                     thread_name="spaces/X/threads/their-msg",
+                     created_time="2026-06-13T11:00:00Z")
+        space_msgs = [{"sender": {"name": ME}, "createTime": "2026-06-13T11:05:00Z"}]
+        assert am.detect_my_reply(
+            item, ME, creds=None,
+            fetch_fn=lambda *a, **k: [],
+            space_fetch_fn=lambda *a, **k: space_msgs,
+        ) is True
+
+    def test_named_space_keeps_thread_scope(self):
+        # A named SPACE room must NOT widen to the space: a reply I posted in a
+        # different thread of the same room is not an answer to THIS item.
+        item = _item(space_type="SPACE",
+                     thread_name="spaces/X/threads/T",
+                     created_time="2026-06-13T11:00:00Z")
+        my_reply_in_thread = [{"sender": {"name": ME}, "createTime": "2026-06-13T11:05:00Z"}]
+        assert am.detect_my_reply(
+            item, ME, creds=None,
+            fetch_fn=lambda *a, **k: my_reply_in_thread,
+            space_fetch_fn=lambda *a, **k: [],  # ignored for named rooms
+        ) is True
+
 
 # --------------------------------------------------------------------------- #
 # _validate_suggestions / generate_reply_suggestions.
