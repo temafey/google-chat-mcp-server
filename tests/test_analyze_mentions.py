@@ -1126,6 +1126,62 @@ class TestTier2ThreadBoundary:
         assert req.mode == "summarize"
 
 
+class TestTier2FlatSpaceRouting:
+    """DMs / group chats thread every message on its own, so Tier-2 must pull a
+    recent SPACE window there instead of the (single-message) per-message thread.
+    Named SPACE rooms keep true thread scoping. Mirrors the detect_my_reply fix.
+    """
+
+    def _route_probe(self, monkeypatch, space_type: str):
+        """Run escalate_item with both fetch seams instrumented; return which
+        one was invoked ('thread' | 'space')."""
+        import google_chat as gchat
+
+        monkeypatch.setattr(
+            gchat, "get_user_display_name",
+            lambda sender, creds=None: sender.get("displayName") or sender.get("name", ""),
+        )
+
+        target_msg = "spaces/A/messages/1"
+        item = _deferred_item(msg=target_msg)
+        item["space_type"] = space_type
+        s = _make_store([item])
+        iid = list(s["items"].keys())[0]
+
+        called = []
+
+        def thread_fetch(creds, space_name, thread_name, *, max_messages=30):
+            called.append("thread")
+            return _canned_thread_messages(target_msg_name=target_msg)
+
+        def space_fetch(creds, space_name, *, max_messages=30):
+            called.append("space")
+            return _canned_thread_messages(target_msg_name=target_msg)
+
+        outcome = am.escalate_item(
+            s["items"][iid],
+            _make_config_tier2(),
+            FakeAdapter(default_result=_ok_summarize_result()),
+            _FAKE_CREDS,
+            NOW,
+            store_obj=s,
+            fetch_fn=thread_fetch,
+            space_fetch_fn=space_fetch,
+        )
+        assert outcome == "escalated"
+        assert len(called) == 1
+        return called[0]
+
+    def test_direct_message_uses_space_window(self, monkeypatch):
+        assert self._route_probe(monkeypatch, "DIRECT_MESSAGE") == "space"
+
+    def test_group_chat_uses_space_window(self, monkeypatch):
+        assert self._route_probe(monkeypatch, "GROUP_CHAT") == "space"
+
+    def test_named_space_uses_thread(self, monkeypatch):
+        assert self._route_probe(monkeypatch, "SPACE") == "thread"
+
+
 class TestTier2StoreOnSuccess:
     """Verify correct field writes on a successful SUMMARIZE."""
 

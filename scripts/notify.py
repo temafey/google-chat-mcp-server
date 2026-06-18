@@ -260,21 +260,31 @@ def _is_new_candidate(item: dict, cfg: dict) -> bool:
 _PRIORITY_ORDER = {"high": 0, "normal": 1, "low": 2}
 
 
-def new_candidates(store_data: dict, cfg: dict) -> list:
-    """Return new-notify candidates sorted by priority (high first, then normal, then low/unset).
+def _digest_sort_key(it: dict):
+    """Sort key for digest rows: priority bucket first, then group by space and
+    read oldest→newest within it.
 
-    Items with equal priority keep their original iteration order (stable tiebreak on
-    dict insertion order, which tracks creation/detection time).
+    Grouping on ``space_name`` keeps a single conversation contiguous, and the
+    ``created_time`` tiebreak makes that conversation read in chronological send
+    order instead of dict-insertion order — so a chain of DMs from one person no
+    longer arrives scrambled (or interleaved with another space's messages)."""
+    return (
+        _PRIORITY_ORDER.get((it.get("priority") or "").lower(), 2),
+        it.get("space_name") or "",
+        it.get("created_time") or "",
+    )
+
+
+def new_candidates(store_data: dict, cfg: dict) -> list:
+    """Return new-notify candidates sorted by priority (high first, then normal,
+    then low/unset), then grouped by space and chronological within each space.
     """
     items = [
         it
         for it in store_data.get("items", {}).values()
         if _is_new_candidate(it, cfg)
     ]
-    return sorted(
-        items,
-        key=lambda it: _PRIORITY_ORDER.get((it.get("priority") or "").lower(), 2),
-    )
+    return sorted(items, key=_digest_sort_key)
 
 
 def escalation_candidates(store_data: dict, now: datetime) -> list:
@@ -319,10 +329,7 @@ def nudge_candidates(store_data: dict, cfg: dict) -> list:
         and it.get("reply_nudged_at") is None
         and not it.get("response_posted")
     ]
-    return sorted(
-        items,
-        key=lambda it: _PRIORITY_ORDER.get((it.get("priority") or "").lower(), 2),
-    )
+    return sorted(items, key=_digest_sort_key)
 
 
 # --------------------------------------------------------------------------- #

@@ -520,3 +520,61 @@ def test_run_once_marks_all_candidates_notified_regardless_of_display_cap(tmp_pa
     rendered = notify.build_digest(dispatched_new, dispatched_esc, now=ACTIVE_NOW)
     assert rendered.splitlines()[1] == "🆕 25 new"
     assert "…and 15 more new" in rendered
+
+
+class TestDigestOrdering:
+    """new_candidates / nudge_candidates: priority bucket first, then grouped by
+    space and chronological (oldest→newest) within each space, so a conversation
+    reads in send order instead of dict-insertion order."""
+
+    def test_chronological_within_space(self):
+        # Same priority, one space, inserted out of order → sorted by created_time.
+        st = _store(
+            _item("c", trigger="user_mention", priority="normal",
+                  created_time="2026-06-15T10:30:00Z"),
+            _item("a", trigger="user_mention", priority="normal",
+                  created_time="2026-06-15T10:00:00Z"),
+            _item("b", trigger="user_mention", priority="normal",
+                  created_time="2026-06-15T10:15:00Z"),
+        )
+        order = [it["id"] for it in notify.new_candidates(st, _cfg())]
+        assert order == ["a", "b", "c"]
+
+    def test_grouped_by_space_then_chronological(self):
+        # Two spaces interleaved on insertion → each space's run stays contiguous
+        # and chronological. Space ordering is by space_name (stable, deterministic).
+        st = _store(
+            _item("y2", trigger="user_mention", priority="normal",
+                  space_name="spaces/Y", created_time="2026-06-15T10:20:00Z"),
+            _item("x1", trigger="user_mention", priority="normal",
+                  space_name="spaces/X", created_time="2026-06-15T10:00:00Z"),
+            _item("y1", trigger="user_mention", priority="normal",
+                  space_name="spaces/Y", created_time="2026-06-15T10:05:00Z"),
+            _item("x2", trigger="user_mention", priority="normal",
+                  space_name="spaces/X", created_time="2026-06-15T10:10:00Z"),
+        )
+        order = [it["id"] for it in notify.new_candidates(st, _cfg())]
+        assert order == ["x1", "x2", "y1", "y2"]
+
+    def test_priority_beats_chronology(self):
+        # A later high-priority message still sorts before an earlier normal one.
+        st = _store(
+            _item("normal_early", trigger="user_mention", priority="normal",
+                  created_time="2026-06-15T09:00:00Z"),
+            _item("high_late", trigger="user_mention", priority="high",
+                  created_time="2026-06-15T11:00:00Z"),
+        )
+        order = [it["id"] for it in notify.new_candidates(st, _cfg())]
+        assert order == ["high_late", "normal_early"]
+
+    def test_nudge_candidates_same_ordering(self):
+        st = _store(
+            _item("n2", status="new", priority="normal",
+                  reply_suggestions=["ok"], reply_nudged_at=None,
+                  created_time="2026-06-15T10:20:00Z"),
+            _item("n1", status="new", priority="normal",
+                  reply_suggestions=["ok"], reply_nudged_at=None,
+                  created_time="2026-06-15T10:00:00Z"),
+        )
+        order = [it["id"] for it in notify.nudge_candidates(st, _cfg())]
+        assert order == ["n1", "n2"]

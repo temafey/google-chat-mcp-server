@@ -102,10 +102,11 @@ def _lang_line(lang) -> str:
         return ""
     suffix = "(keep all JSON keys and enum values in English).\n"
     if code in ("source", "auto", "same"):
-        return ('Write the "summary" and "priority_reason" values in the same '
-                "language as the chat content " + suffix)
+        return ('LANGUAGE: write the "summary" and "priority_reason" values in the '
+                "same language as the chat content. " + suffix)
     name = _LANG_NAMES.get(code, code.upper())
-    return f'Write the "summary" and "priority_reason" values in {name} ' + suffix
+    return (f'LANGUAGE: ALWAYS write the "summary" and "priority_reason" values in '
+            f"{name}, even when the chat content is in another language. " + suffix)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +142,10 @@ addressing={addressing}; trigger={trigger}.
   "confidence": 0.0-1.0
 }}
 Rules:
+- GROUNDING: use ONLY facts present in <message>/<quoted>. NEVER invent specifics
+  absent from the input — no system/tool names, ticket/PR/issue numbers, links, or
+  references to "the previous message". If meaning depends on missing prior context,
+  set context_sufficient=false and keep "summary" generic; do NOT guess what it means.
 - Deictic/elliptical ("this one","^","any update?") with no resolving <quoted>
   => type="continuation", context_sufficient=false, priority<="normal".
 - direct_request/decision_needed to {me_name} with deadline/blocker word => "high".
@@ -173,6 +178,10 @@ addressing={addressing}; trigger={trigger}.
   "confidence": 0.0-1.0
 }}
 Rules:
+- GROUNDING: use ONLY facts present in <message>. NEVER invent specifics absent from
+  the input — no system/tool names, ticket/PR/issue numbers, links, or references to
+  "the previous message". A bare fragment whose meaning depends on missing prior
+  context MUST be context_sufficient=false with a generic "summary"; do NOT guess.
 - Deictic/elliptical ("this one","^","any update?") with no quoted context
   => type="continuation", context_sufficient=false, priority<="normal".
 - direct_request/decision_needed to {me_name} with deadline/blocker word => "high".
@@ -256,6 +265,8 @@ space={space_display} ({space_type})
 _SUMMARIZE_FOOTER = """\
 </thread>
 
+GROUNDING: base the summary ONLY on what appears in <thread> above. Do NOT invent
+systems, ticket/PR numbers, links, or facts that are not present in the thread.
 {lang_line}Return ONLY this JSON:
 {{
   "type": "direct_request|question|decision_needed|status_update|fyi|social|unclear",

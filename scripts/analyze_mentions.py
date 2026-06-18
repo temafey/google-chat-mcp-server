@@ -645,19 +645,25 @@ def escalate_item(
     *,
     store_obj: dict,
     fetch_fn=None,
+    space_fetch_fn=None,
     log=None,
     dry_run: bool = False,
 ) -> str:
     """Run Tier-2 SUMMARIZE for a single DEFER'd item.
 
-    Fetches the thread, calls SUMMARIZE, validates schema, and writes results
-    via ``store.set_fields``.  Returns one of:
+    Fetches the conversation, calls SUMMARIZE, validates schema, and writes
+    results via ``store.set_fields``.  Returns one of:
       ``"escalated"``  — SUMMARIZE succeeded; fields written.
       ``"failed"``     — fetch error, adapter error, or schema invalid; item
                          stays DEFER'd so next run retries.
 
-    *fetch_fn* is injectable for tests (monkeypatches the thread fetch);
-    defaults to ``google_chat._list_thread_messages_sync``.
+    Context scope follows the space's threading model (mirrors
+    ``detect_my_reply``): FLAT spaces (DIRECT_MESSAGE / GROUP_CHAT) thread every
+    message on its own, so the per-message thread carries no conversation — we
+    pull a recent SPACE window there. Named SPACE rooms keep true thread scoping.
+
+    *fetch_fn* / *space_fetch_fn* are injectable for tests; they default to
+    ``google_chat._list_thread_messages_sync`` / ``_list_space_window_sync``.
 
     Security:
       - Only calls messages.list (READ-ONLY).
@@ -678,14 +684,24 @@ def escalate_item(
 
     space_name = item.get("space_name") or ""
     thread_name = item.get("thread_name") or ""
+    space_type = (item.get("space_type") or "").upper()
 
-    # --- Fetch thread messages --------------------------------------------- #
+    # --- Fetch conversation ------------------------------------------------ #
+    # FLAT spaces (DIRECT_MESSAGE / GROUP_CHAT) thread every message on its own,
+    # so the per-message thread carries no conversation — pull a recent space
+    # window instead. Named SPACE rooms keep true thread scoping.
+    flat_space = space_type in ("DIRECT_MESSAGE", "GROUP_CHAT")
+    import google_chat as gchat  # noqa: PLC0415
     if fetch_fn is None:
-        import google_chat as gchat  # noqa: PLC0415
         fetch_fn = gchat._list_thread_messages_sync
+    if space_fetch_fn is None:
+        space_fetch_fn = gchat._list_space_window_sync
 
     try:
-        messages = fetch_fn(creds, space_name, thread_name, max_messages=thread_max)
+        if flat_space:
+            messages = space_fetch_fn(creds, space_name, max_messages=thread_max)
+        else:
+            messages = fetch_fn(creds, space_name, thread_name, max_messages=thread_max)
     except Exception as exc:  # noqa: BLE001
         _log("tier2-fetch-error", error=str(exc))
         return "failed"
@@ -757,6 +773,7 @@ def run_tier2(
     *,
     adapter: Optional[AnalysisAdapter] = None,
     fetch_fn=None,
+    space_fetch_fn=None,
     dry_run: bool = False,
     limit: Optional[int] = None,
     log=None,
@@ -801,6 +818,7 @@ def run_tier2(
             now,
             store_obj=store_obj,
             fetch_fn=fetch_fn,
+            space_fetch_fn=space_fetch_fn,
             log=log,
             dry_run=dry_run,
         )

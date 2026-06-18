@@ -990,6 +990,41 @@ def _list_messages_sync(
     return messages
 
 
+def _list_space_window_sync(
+    creds: Credentials,
+    space_name: str,
+    *,
+    max_messages: int = 30,
+    before_iso: Optional[str] = None,
+) -> List[Dict]:
+    """Synchronous fetch of the most-recent *max_messages* in a space.
+
+    Used to assemble conversational context for FLAT spaces (DIRECT_MESSAGE /
+    GROUP_CHAT) where every message is its own thread, so a thread-scoped fetch
+    would only ever return a single message. Here "the conversation" IS the
+    space, so we pull a bounded recent window instead.
+
+    Fetches a single page ordered ``create_time DESC`` (newest first, capped at
+    *max_messages*), then returns it in chronological order (oldest first) so it
+    drops into the same TARGET-marking logic as ``_list_thread_messages_sync``.
+    Optional *before_iso* upper-bounds the window (``createTime < before_iso``).
+
+    READ-ONLY: only calls ``messages.list``. Never writes to Chat.
+    """
+    service = build('chat', 'v1', credentials=creds)
+    kwargs: Dict[str, Any] = {
+        "parent": space_name,
+        "pageSize": max_messages,
+        "orderBy": "create_time DESC",
+    }
+    if before_iso:
+        kwargs["filter"] = f'createTime < "{before_iso}"'
+    resp = service.spaces().messages().list(**kwargs).execute()
+    messages = resp.get("messages", [])
+    messages.reverse()  # DESC page → chronological (oldest first)
+    return messages
+
+
 def _list_thread_messages_sync(
     creds: Credentials,
     space_name: str,
