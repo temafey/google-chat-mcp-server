@@ -5,15 +5,17 @@ import fcntl
 import logging
 import mimetypes
 import tempfile
+import threading
 import datetime
 from contextlib import contextmanager
 from typing import Any, List, Dict, Optional, Tuple
+import google_auth_httplib2
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, build_http
 from pathlib import Path
 
 # Logs to stderr (or nowhere if unconfigured) — never stdout, which the MCP
@@ -142,6 +144,90 @@ def set_upload_dir(path: str) -> None:
 
 def get_upload_dir() -> Path:
     return _upload_dir
+
+
+# --- Shared googleapiclient Resource cache -----------------------------------
+#
+# googleapiclient materializes sub-resources LAZILY: every `service.spaces()
+# .messages()` regenerates that resource's methods, its pretty-printed JSON
+# schemas and a 731 KB `__doc__` string — 20 MB and 78 ms per call. Building a
+# service per call (and re-walking the accessor inside a pagination loop) made a
+# 213-space search peak at 1.5 GB of Python objects / 1.9 GB RSS. Cache the
+# terminal sub-resource instead: the tax is then paid once per process.
+#
+# The Resource is safe to share across threads; its httplib2 connection pool is
+# NOT. So the cached Resource is built with an UNAUTHENTICATED transport and
+# every request goes through _exec(), which supplies a per-thread authorized one.
+_service_cache: Dict[Tuple, Any] = {}
+_service_cache_lock = threading.RLock()  # RLock: _resource() recurses on a miss
+_thread_local = threading.local()
+
+
+def _resource(api: str, version: str, *path: str):
+    """Return a cached Resource, e.g. ``_resource('chat', 'v1', 'spaces', 'messages')``.
+
+    The cached Resource deliberately carries NO credentials: they are replaced
+    wholesale on token reload/re-auth (see get_credentials), and its connection
+    pool is not thread-safe. Callers MUST execute via _exec(); a bare .execute()
+    on this Resource is unauthenticated and fails with a hard 401 rather than
+    silently racing across worker threads.
+    """
+    key = (api, version, path)
+    res = _service_cache.get(key)  # atomic under the GIL
+    if res is not None:
+        return res
+    with _service_cache_lock:
+        res = _service_cache.get(key)  # double-checked
+        if res is not None:
+            return res
+        if path:
+            parent = _resource(api, version, *path[:-1])
+            res = getattr(parent, path[-1])()
+        else:
+            # http= and credentials= are mutually exclusive; passing http= also
+            # skips the Application Default Credentials probe that a bare
+            # build(api, version) would trigger.
+            res = build(api, version, http=build_http())
+        _service_cache[key] = res
+        return res
+
+
+def _thread_http():
+    """Per-thread httplib2 transport (connection pool).
+
+    build_http(), not httplib2.Http(): the latter has NO timeout, so one
+    blackholed connection would wedge a worker thread — and an asyncio.gather
+    over every space — forever. build_http() also drops 308 from redirect_codes,
+    which resumable uploads depend on.
+    """
+    http = getattr(_thread_local, "http", None)
+    if http is None:
+        http = build_http()
+        _thread_local.http = http
+    return http
+
+
+def _exec(request, creds: Credentials):
+    """Execute a googleapiclient request. The ONLY sanctioned way to do so.
+
+    Binds the *current* credentials to this thread's transport, which is why the
+    shared Resource never has to hold credentials of its own.
+    """
+    if creds is None:
+        raise ValueError("credentials are required to execute a Google API request")
+    return request.execute(
+        http=google_auth_httplib2.AuthorizedHttp(creds, http=_thread_http())
+    )
+
+
+def reset_service_cache() -> None:
+    """Drop every cached Resource. For tests and re-auth.
+
+    Per-thread transports are credential-free and are deliberately left alone.
+    """
+    with _service_cache_lock:
+        _service_cache.clear()
+
 
 def _token_lock_path(token_path) -> Path:
     """Path of the advisory lock guarding token refresh: ``<token>.lock``.
@@ -458,7 +544,7 @@ def warm_directory_cache(
     names: Dict[str, str] = {}
     profiles: Dict[str, Dict[str, Optional[str]]] = {}
     try:
-        service = build('people', 'v1', credentials=creds)
+        people = _resource('people', 'v1', 'people')
         page_token: Optional[str] = None
         while True:
             kwargs: Dict[str, Any] = {
@@ -470,7 +556,7 @@ def warm_directory_cache(
             }
             if page_token:
                 kwargs["pageToken"] = page_token
-            resp = service.people().listDirectoryPeople(**kwargs).execute()
+            resp = _exec(people.listDirectoryPeople(**kwargs), creds)
             for person in resp.get("people", []):
                 person_names = person.get("names") or []
                 display = person_names[0].get("displayName") if person_names else None
@@ -656,11 +742,10 @@ def resolve_one_via_people_get(
     if not numeric_id or creds is None:
         return None
     try:
-        service = build('people', 'v1', credentials=creds)
-        person = (
-            service.people()
-            .get(resourceName=f"people/{numeric_id}", personFields="names")
-            .execute()
+        people = _resource('people', 'v1', 'people')
+        person = _exec(
+            people.get(resourceName=f"people/{numeric_id}", personFields="names"),
+            creds,
         )
         person_names = person.get("names") or []
         display = person_names[0].get("displayName") if person_names else None
@@ -688,14 +773,14 @@ async def list_chat_spaces() -> List[Dict]:
         if not creds:
             raise Exception("No valid credentials found. Please authenticate first.")
 
-        service = build('chat', 'v1', credentials=creds)
+        spaces = _resource('chat', 'v1', 'spaces')
         all_spaces: List[Dict] = []
         page_token: Optional[str] = None
         while True:
             kwargs: Dict[str, Any] = {"pageSize": 100}
             if page_token:
                 kwargs["pageToken"] = page_token
-            resp = service.spaces().list(**kwargs).execute()
+            resp = _exec(spaces.list(**kwargs), creds)
             all_spaces.extend(resp.get('spaces', []))
             page_token = resp.get('nextPageToken')
             if not page_token:
@@ -761,8 +846,8 @@ async def list_space_messages(space_name: str,
         if not creds:
             raise Exception("No valid credentials found. Please authenticate first.")
             
-        service = build('chat', 'v1', credentials=creds)
-        
+        msgs = _resource('chat', 'v1', 'spaces', 'messages')
+
         # Prepare filter string based on provided dates
         filter_str = None
         if start_date:
@@ -789,8 +874,9 @@ async def list_space_messages(space_name: str,
             if page_token:
                 list_args['pageToken'] = page_token
                 
-            response = service.spaces().messages().list(**list_args).execute()
-            
+            response = _exec(msgs.list(**list_args), creds)
+
+
             # Extend messages list with current page results
             current_page_messages = response.get('messages', [])
             if current_page_messages:
@@ -878,7 +964,7 @@ async def send_message(
     if not creds:
         raise Exception("No valid credentials found. Please authenticate first.")
 
-    service = build('chat', 'v1', credentials=creds)
+    msgs = _resource('chat', 'v1', 'spaces', 'messages')
     body: Dict[str, Any] = {"text": text}
     create_kwargs: Dict[str, Any] = {"parent": space_name, "body": body}
     if thread_name:
@@ -886,7 +972,7 @@ async def send_message(
         create_kwargs["messageReplyOption"] = "REPLY_MESSAGE_OR_FAIL"
 
     try:
-        return service.spaces().messages().create(**create_kwargs).execute()
+        return _exec(msgs.create(**create_kwargs), creds)
     except HttpError as err:
         return _http_error_to_dict(err)
 
@@ -931,14 +1017,21 @@ async def upload_attachment(
 
     mimetype = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
     media = MediaFileUpload(str(resolved), mimetype=mimetype)
-    service = build('chat', 'v1', credentials=creds)
+    media_api = _resource('chat', 'v1', 'media')
+    msgs = _resource('chat', 'v1', 'spaces', 'messages')
 
     try:
-        uploaded = service.media().upload(
-            parent=space_name,
-            body={"filename": resolved.name},
-            media_body=media,
-        ).execute()
+        # Non-resumable upload: the body is multipart-encoded when the request is
+        # built, so _exec's transport override carries it. (Even resumable would
+        # be fine — execute() forwards http= into next_chunk.)
+        uploaded = _exec(
+            media_api.upload(
+                parent=space_name,
+                body={"filename": resolved.name},
+                media_body=media,
+            ),
+            creds,
+        )
     except HttpError as err:
         return _http_error_to_dict(err)
 
@@ -949,7 +1042,7 @@ async def upload_attachment(
         create_kwargs["messageReplyOption"] = "REPLY_MESSAGE_OR_FAIL"
 
     try:
-        return service.spaces().messages().create(**create_kwargs).execute()
+        return _exec(msgs.create(**create_kwargs), creds)
     except HttpError as err:
         return _http_error_to_dict(err)
 
@@ -962,11 +1055,15 @@ def _list_messages_sync(
 ) -> List[Dict]:
     """Synchronous paginated `messages.list` — runs in a worker thread.
 
-    Builds a fresh `chat` service per call so it is safe to invoke from
-    multiple threads concurrently (googleapiclient services are not
-    documented as thread-safe).
+    Safe to invoke from multiple threads concurrently: the Resource is shared
+    and stateless, and _exec() gives each thread its own HTTP transport.
+
+    The `messages` resource is fetched ONCE, above the loop. Re-walking
+    `service.spaces().messages()` per page would re-materialize 20 MB of schemas
+    and docstrings on every iteration — that is what made this the single
+    hungriest call path in the process.
     """
-    service = build('chat', 'v1', credentials=creds)
+    msgs = _resource('chat', 'v1', 'spaces', 'messages')
     filter_parts: List[str] = []
     if start_iso:
         filter_parts.append(f'createTime > "{start_iso}"')
@@ -982,7 +1079,7 @@ def _list_messages_sync(
             kwargs["filter"] = filter_str
         if page_token:
             kwargs["pageToken"] = page_token
-        resp = service.spaces().messages().list(**kwargs).execute()
+        resp = _exec(msgs.list(**kwargs), creds)
         messages.extend(resp.get("messages", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -1011,7 +1108,7 @@ def _list_space_window_sync(
 
     READ-ONLY: only calls ``messages.list``. Never writes to Chat.
     """
-    service = build('chat', 'v1', credentials=creds)
+    msgs = _resource('chat', 'v1', 'spaces', 'messages')
     kwargs: Dict[str, Any] = {
         "parent": space_name,
         "pageSize": max_messages,
@@ -1019,7 +1116,7 @@ def _list_space_window_sync(
     }
     if before_iso:
         kwargs["filter"] = f'createTime < "{before_iso}"'
-    resp = service.spaces().messages().list(**kwargs).execute()
+    resp = _exec(msgs.list(**kwargs), creds)
     messages = resp.get("messages", [])
     messages.reverse()  # DESC page → chronological (oldest first)
     return messages
@@ -1051,7 +1148,7 @@ def _list_thread_messages_sync(
     Returns:
         List of raw message dicts, oldest first, at most *max_messages*.
     """
-    service = build('chat', 'v1', credentials=creds)
+    msgs = _resource('chat', 'v1', 'spaces', 'messages')
     filter_str = f'thread.name = "{thread_name}"'
 
     messages: List[Dict] = []
@@ -1068,7 +1165,7 @@ def _list_thread_messages_sync(
         }
         if page_token:
             kwargs["pageToken"] = page_token
-        resp = service.spaces().messages().list(**kwargs).execute()
+        resp = _exec(msgs.list(**kwargs), creds)
         messages.extend(resp.get("messages", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -1089,8 +1186,8 @@ def _resolve_me_sync(creds: Credentials) -> str:
     user's own name so search results show "Artem Onyshchenko" rather than
     the raw `users/<id>`.
     """
-    oauth2 = build('oauth2', 'v2', credentials=creds)
-    info = oauth2.userinfo().get().execute()
+    userinfo = _resource('oauth2', 'v2', 'userinfo')
+    info = _exec(userinfo.get(), creds)
     user_id_raw = info.get("id")
     if not user_id_raw:
         raise Exception("Could not resolve current user ID from userinfo endpoint")
@@ -1212,18 +1309,18 @@ def _list_space_members_sync(
 ) -> List[Dict]:
     """Synchronous paginated `spaces.members.list` — runs in a worker thread.
 
-    Builds a fresh `chat` service per call (googleapiclient services aren't
-    documented as thread-safe). Returns the raw `memberships` list — the
-    caller can pull `member.name` / `member.displayName` from each.
+    Safe under concurrency via the shared Resource + per-thread transport (see
+    _resource/_exec). Returns the raw `memberships` list — the caller can pull
+    `member.name` / `member.displayName` from each.
     """
-    service = build('chat', 'v1', credentials=creds)
+    members = _resource('chat', 'v1', 'spaces', 'members')
     memberships: List[Dict] = []
     page_token: Optional[str] = None
     while True:
         kwargs: Dict[str, Any] = {"parent": space_name, "pageSize": 1000}
         if page_token:
             kwargs["pageToken"] = page_token
-        resp = service.spaces().members().list(**kwargs).execute()
+        resp = _exec(members.list(**kwargs), creds)
         memberships.extend(resp.get("memberships", []))
         page_token = resp.get("nextPageToken")
         if not page_token:

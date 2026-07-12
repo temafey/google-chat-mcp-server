@@ -67,7 +67,11 @@ def _fake_people_service(*, pages=None, get_map=None, list_error=None, get_error
     def _list(**kwargs):
         call = MagicMock()
 
-        def _execute():
+        # **_kwargs: production executes via google_chat._exec, which passes
+        # http=<per-thread transport>. A zero-arg stub would TypeError — and
+        # warm_directory_cache swallows exceptions, so it would surface as a
+        # bogus "the directory came back empty" rather than a mocking bug.
+        def _execute(**_kwargs):
             if list_error is not None:
                 raise list_error
             idx = list_calls["n"]
@@ -82,7 +86,7 @@ def _fake_people_service(*, pages=None, get_map=None, list_error=None, get_error
     def _get(resourceName=None, personFields=None):
         call = MagicMock()
 
-        def _execute():
+        def _execute(**_kwargs):  # see the note on _list's _execute
             if get_error is not None:
                 raise get_error
             return (get_map or {}).get(resourceName, {"names": []})

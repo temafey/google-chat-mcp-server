@@ -21,6 +21,23 @@ sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 sys.path.insert(0, str(_REPO_ROOT))
 
 import store as _store_module  # noqa: E402
+import google_chat as _google_chat  # noqa: E402
+
+
+@pytest.fixture(autouse=True, scope="function")
+def _reset_google_chat_service_cache():
+    """Drop google_chat's shared Resource cache around every test.
+
+    Mandatory, not hygiene. The cache is module-level and process-wide, so a
+    Resource built by an earlier test would survive into the next one — and
+    since a cache hit never calls ``build``, every
+    ``patch.object(google_chat, "build", ...)`` in the suite would silently
+    become a no-op, asserting against a stale mock. Reset on BOTH sides so no
+    test ordering can matter.
+    """
+    _google_chat.reset_service_cache()
+    yield
+    _google_chat.reset_service_cache()
 
 
 @pytest.fixture(autouse=True, scope="function")

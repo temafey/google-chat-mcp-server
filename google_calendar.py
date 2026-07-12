@@ -17,7 +17,6 @@ import json
 from typing import Any, Dict, List, Optional
 
 from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 import google_chat  # imported as a module so SAVE_TOKEN_MODE is read live, not snapshotted
@@ -65,10 +64,23 @@ def _http_error_to_dict(err: HttpError) -> Dict[str, Any]:
     return {"error": message, "status": status}
 
 
-def _build_service(creds: Credentials):
-    """Build a fresh Calendar v3 service. googleapiclient services aren't
-    documented as thread-safe, so build per-call when offloading to a worker."""
-    return build('calendar', 'v3', credentials=creds)
+def _resource(*path: str):
+    """Cached Calendar v3 sub-resource, e.g. ``_resource('events')``.
+
+    Reuses google_chat's shared-Resource layer: building a service per call and
+    re-walking ``service.events()`` inside a pagination loop re-materializes the
+    resource's schemas and docstrings every time (megabytes, tens of ms).
+    """
+    return google_chat._resource('calendar', 'v3', *path)
+
+
+def _exec(request, creds: Credentials):
+    """Execute a request on this thread's authorized transport (google_chat._exec).
+
+    Called through the module (not aliased at import) so tests that patch the
+    transport layer see the live function.
+    """
+    return google_chat._exec(request, creds)
 
 
 def _filter_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -124,14 +136,14 @@ def _parse_date_or_datetime(value: str, end_of_day: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 def _list_calendars_sync(creds: Credentials) -> List[Dict[str, Any]]:
-    service = _build_service(creds)
+    calendar_list = _resource('calendarList')
     out: List[Dict[str, Any]] = []
     page_token: Optional[str] = None
     while True:
         kwargs: Dict[str, Any] = {"maxResults": 250}
         if page_token:
             kwargs["pageToken"] = page_token
-        resp = service.calendarList().list(**kwargs).execute()
+        resp = _exec(calendar_list.list(**kwargs), creds)
         out.extend(resp.get('items', []))
         page_token = resp.get('nextPageToken')
         if not page_token:
@@ -185,7 +197,7 @@ def _list_events_sync(
     order_by: Optional[str],
     max_results_per_page: int,
 ) -> List[Dict[str, Any]]:
-    service = _build_service(creds)
+    events_api = _resource('events')
     events: List[Dict[str, Any]] = []
     page_token: Optional[str] = None
     while True:
@@ -204,7 +216,7 @@ def _list_events_sync(
             kwargs["orderBy"] = order_by
         if page_token:
             kwargs["pageToken"] = page_token
-        resp = service.events().list(**kwargs).execute()
+        resp = _exec(events_api.list(**kwargs), creds)
         events.extend(resp.get('items', []))
         page_token = resp.get('nextPageToken')
         if not page_token:
@@ -271,8 +283,10 @@ async def get_calendar_event(calendar_id: str, event_id: str) -> Dict[str, Any]:
         raise Exception("No valid credentials found. Please authenticate first.")
 
     def _get() -> Dict[str, Any]:
-        service = _build_service(creds)
-        return service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+        return _exec(
+            _resource('events').get(calendarId=calendar_id, eventId=event_id),
+            creds,
+        )
 
     try:
         event = await asyncio.to_thread(_get)
@@ -350,12 +364,14 @@ async def create_calendar_event(
     body = _build_event_body(summary, start, end, description, location, attendees, time_zone)
 
     def _insert() -> Dict[str, Any]:
-        service = _build_service(creds)
-        return service.events().insert(
-            calendarId=calendar_id,
-            body=body,
-            sendUpdates=send_updates,
-        ).execute()
+        return _exec(
+            _resource('events').insert(
+                calendarId=calendar_id,
+                body=body,
+                sendUpdates=send_updates,
+            ),
+            creds,
+        )
 
     try:
         event = await asyncio.to_thread(_insert)
@@ -402,8 +418,10 @@ async def update_calendar_event(
     if start is not None or end is not None:
         # Need both start and end to be coherent on update. Fetch missing side.
         def _get_existing() -> Dict[str, Any]:
-            service = _build_service(creds)
-            return service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+            return _exec(
+                _resource('events').get(calendarId=calendar_id, eventId=event_id),
+                creds,
+            )
 
         existing: Optional[Dict[str, Any]] = None
         if start is None or end is None:
@@ -436,13 +454,15 @@ async def update_calendar_event(
         raise ValueError("No fields supplied to update")
 
     def _patch() -> Dict[str, Any]:
-        service = _build_service(creds)
-        return service.events().patch(
-            calendarId=calendar_id,
-            eventId=event_id,
-            body=body,
-            sendUpdates=send_updates,
-        ).execute()
+        return _exec(
+            _resource('events').patch(
+                calendarId=calendar_id,
+                eventId=event_id,
+                body=body,
+                sendUpdates=send_updates,
+            ),
+            creds,
+        )
 
     try:
         event = await asyncio.to_thread(_patch)
@@ -466,12 +486,14 @@ async def delete_calendar_event(
         raise Exception("No valid credentials found. Please authenticate first.")
 
     def _delete() -> None:
-        service = _build_service(creds)
-        service.events().delete(
-            calendarId=calendar_id,
-            eventId=event_id,
-            sendUpdates=send_updates,
-        ).execute()
+        _exec(
+            _resource('events').delete(
+                calendarId=calendar_id,
+                eventId=event_id,
+                sendUpdates=send_updates,
+            ),
+            creds,
+        )
 
     try:
         await asyncio.to_thread(_delete)
@@ -495,12 +517,14 @@ async def quick_add_event(
         raise Exception("No valid credentials found. Please authenticate first.")
 
     def _quick_add() -> Dict[str, Any]:
-        service = _build_service(creds)
-        return service.events().quickAdd(
-            calendarId=calendar_id,
-            text=text,
-            sendUpdates=send_updates,
-        ).execute()
+        return _exec(
+            _resource('events').quickAdd(
+                calendarId=calendar_id,
+                text=text,
+                sendUpdates=send_updates,
+            ),
+            creds,
+        )
 
     try:
         event = await asyncio.to_thread(_quick_add)
@@ -543,8 +567,7 @@ async def query_freebusy(
         body['timeZone'] = time_zone
 
     def _query() -> Dict[str, Any]:
-        service = _build_service(creds)
-        return service.freebusy().query(body=body).execute()
+        return _exec(_resource('freebusy').query(body=body), creds)
 
     try:
         resp = await asyncio.to_thread(_query)
