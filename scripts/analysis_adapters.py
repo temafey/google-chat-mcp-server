@@ -330,7 +330,11 @@ def _extract_inner_json(text: str) -> Optional[dict]:
 class ClaudeAdapter(AnalysisAdapter):
     """Runs analysis via the ``claude`` CLI subprocess.
 
-    Spawns: ``claude -p --model <model> --output-format json <prompt>``
+    Spawns: ``claude -p --model <model> --output-format json --strict-mcp-config <prompt>``
+
+    ``--strict-mcp-config`` (with no ``--mcp-config``) disables ALL MCP servers,
+    so the repo's ``.mcp.json`` (google_chat + serena) is never loaded — the
+    classification task uses no tools, so MCP boot is pure overhead/failure risk.
 
     The child process inherits a sanitized environment (no triage secrets).
     stdout is capped at ``_RAW_CAP`` characters before storage.
@@ -370,11 +374,18 @@ class ClaudeAdapter(AnalysisAdapter):
             )
 
         # 2. Build argv (NEVER shell=True).
+        # --strict-mcp-config with no --mcp-config loads ZERO MCP servers,
+        # ignoring the repo's .mcp.json (google_chat + serena).  Classification
+        # returns pure JSON and uses no tools, so booting those servers is pure
+        # overhead: startup latency (risking the 60s timeout), extra context
+        # tokens, and — in cron's credential-less env — a guaranteed google_chat
+        # MCP boot failure.  Disabling MCP keeps this call fast and hermetic.
         argv = [
             "claude",
             "-p",
             "--model", request.model,
             "--output-format", "json",
+            "--strict-mcp-config",
             request.prompt,
         ]
 

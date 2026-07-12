@@ -315,6 +315,23 @@ class TestArgvAndEnv(unittest.TestCase):
         # shell must be False (or absent, defaulting to False)
         self.assertFalse(call_kwargs.get("shell", False))
 
+    def test_argv_disables_mcp(self):
+        """argv must pass --strict-mcp-config (no --mcp-config) so ZERO MCP
+        servers load — the repo's .mcp.json (google_chat + serena) is ignored.
+        Classification uses no tools; MCP boot is pure overhead/failure risk."""
+        adapter = ClaudeAdapter()
+        adapter._available_cache = True
+        req = AnalysisRequest(mode="classify", prompt="p", model="claude-haiku-4-5-20251001")
+        proc = _make_completed_proc(stdout=_make_envelope(json.dumps({"ok": True})))
+
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            adapter.run(req)
+
+        argv = mock_run.call_args[0][0]
+        self.assertIn("--strict-mcp-config", argv)
+        # Guard: no --mcp-config, else strict mode would re-enable servers.
+        self.assertNotIn("--mcp-config", argv)
+
     def test_sanitized_env_no_telegram_token(self):
         """TELEGRAM_BOT_TOKEN must not appear in the env passed to subprocess."""
         adapter = ClaudeAdapter()

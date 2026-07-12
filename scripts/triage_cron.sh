@@ -51,6 +51,14 @@ export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 # them regardless of how cron invokes us.
 export PYTHONPATH="$REPO"
 
+# The analyze step spawns the `claude` CLI, which reads its OAuth credentials
+# from CLAUDE_CONFIG_DIR (default: ~/.claude).  cron does NOT source .bashrc, so
+# without this the CLI falls back to a STALE ~/.claude/.credentials.json and every
+# call fails with HTTP 401 (root cause of the historical failed=N-per-tick).
+# analysis_adapters._build_clean_env keeps CLAUDE_* vars, so this propagates to
+# the subprocess.  Point it at the actively-refreshed config dir.
+export CLAUDE_CONFIG_DIR="/home/temafey/.claude-primary"
+
 # --- Logging --------------------------------------------------------------- #
 LOGDIR="$HOME/.claude-orchestrator/gchat-triage/logs"
 mkdir -p "$LOGDIR"
