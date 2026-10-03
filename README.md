@@ -45,7 +45,7 @@ Local FastAPI auth server for easy OAuth setup is shared by both integrations.
 
 ## Requirements
 
-- Python 3.13+
+- Python 3.14+
 - Google Cloud project with the following APIs enabled:
   - Google Chat API
   - Google Calendar API
